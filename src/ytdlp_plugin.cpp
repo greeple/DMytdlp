@@ -161,10 +161,27 @@ static ULONG __stdcall PI_Release(void* self) {
 }
 
 static void SetRet(BSTR* ret, const std::wstring& s){ if (ret) *ret = SysAllocStringLen(s.data(), (UINT)s.size()); }
-static void __stdcall PI_getID(BSTR* ret, void*)            { WriteMarker(L"ytdlp_getID.txt"); SetRet(ret, L"{F1E5C3A0-8C33-4D4C-8DE0-6B5ACF0F31C5}"); }
-static void __stdcall PI_GetName(BSTR* ret, void*)          { WriteMarker(L"ytdlp_GetName.txt"); SetRet(ret, L"ytdlp plugin"); }
-static void __stdcall PI_GetVersion(BSTR* ret, void*)       { WriteMarker(L"ytdlp_GetVersion.txt"); SetRet(ret, L"0.1.0"); }
-static void __stdcall PI_GetMinAppVersion(BSTR* ret, void*) { WriteMarker(L"ytdlp_GetMinAppVersion.txt"); SetRet(ret, L"5.0.2"); }
+
+static void __stdcall PI_getID(BSTR* ret, void*) {
+    WriteMarker(L"ytdlp_getID.txt");
+    SetRet(ret, L"{F1E5C3A0-8C33-4D4C-8DE0-6B5ACF0F31C5}");
+}
+
+static void __stdcall PI_GetName(BSTR* ret, void*) {
+    WriteMarker(L"ytdlp_GetName.txt");
+    SetRet(ret, L"ytdlp plugin");
+}
+
+static void __stdcall PI_GetVersion(BSTR* ret, void*) {
+    WriteMarker(L"ytdlp_GetVersion.txt");
+    SetRet(ret, L"0.1.0");
+}
+
+static void __stdcall PI_GetMinAppVersion(BSTR* ret, void*) {
+    WriteMarker(L"ytdlp_GetMinAppVersion.txt");
+    SetRet(ret, L"5.0.2");
+}
+
 static void __stdcall PI_GetDescription(BSTR* ret, void*, BSTR lang) {
     WriteMarker(L"ytdlp_GetDescription.txt");
     std::wstring l = lang ? std::wstring(lang, SysStringLen(lang)) : L"";
@@ -173,10 +190,18 @@ static void __stdcall PI_GetDescription(BSTR* ret, void*, BSTR lang) {
     else
         SetRet(ret, L"Plugin: runs yt-dlp and fills description.");
 }
-static void __stdcall PI_GetEmail(BSTR* ret, void*)         { SetRet(ret, L"dev@example.com"); }
-static void __stdcall PI_GetHomepage(BSTR* ret, void*)      { SetRet(ret, L"https://example.com"); }
-static void __stdcall PI_GetCopyright(BSTR* ret, void*)     { SetRet(ret, L"\x00A9 2025 Example"); }
-static void __stdcall PI_GetMinAppVersion(BSTR* ret, void*) { SetRet(ret, L"5.0.2"); }
+
+static void __stdcall PI_GetEmail(BSTR* ret, void*) {
+    SetRet(ret, L"dev@example.com");
+}
+
+static void __stdcall PI_GetHomepage(BSTR* ret, void*) {
+    SetRet(ret, L"https://example.com");
+}
+
+static void __stdcall PI_GetCopyright(BSTR* ret, void*) {
+    SetRet(ret, L"\x00A9 2025 Example");
+}
 
 static std::wstring ReadIniYtDlp(const std::wstring& dir) {
     if (dir.empty()) return L"yt-dlp.exe";
