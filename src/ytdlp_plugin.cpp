@@ -10,7 +10,7 @@
 #include <memory>
 
 #pragma comment(lib, "oleaut32.lib")
-
+#pragma comment(linker, "/export:RegisterPlugIn=_RegisterPlugIn@0")
 // GUIDs из DMPluginIntf.pas
 struct __declspec(uuid("B412B405-0578-4B99-BB06-368CDA0B2F8C")) IDMInterface : public IUnknown {
     virtual BSTR __stdcall DoAction(BSTR action, BSTR parameters) = 0;
@@ -244,10 +244,22 @@ private:
     IDMInterface* m_dm;
     std::wstring  m_pluginDir;
 };
+static HMODULE g_hModule = nullptr;
 
-// ВАЖНО: экспорт только через .def
-extern "C" IDMPlugIn* __stdcall RegisterPlugIn() {
+static void WriteMarker(LPCWSTR name) {
+    wchar_t path[MAX_PATH];
+    DWORD n = GetModuleFileNameW(g_hModule, path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return;
+    for (int i = (int)n - 1; i >= 0; --i) {
+        if (path[i] == L'\\' || path[i] == L'/') { path[i+1] = 0; break; }
+    }
+    std::wstring f = std::wstring(path) + name;
+    HANDLE h = CreateFileW(f.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+}
+extern "C" __declspec(dllexport) IDMPlugIn* __stdcall RegisterPlugIn() {
     OutputDebugStringW(L"[ytdlp] RegisterPlugIn called\n");
+    WriteMarker(L"ytdlp_RegisterPlugIn_called.txt");
     try {
         return new Plugin();
     } catch (...) {
@@ -255,8 +267,9 @@ extern "C" IDMPlugIn* __stdcall RegisterPlugIn() {
     }
 }
 
-BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
+        g_hModule = h;
         OutputDebugStringW(L"[ytdlp] DllMain attach\n");
     }
     return TRUE;
