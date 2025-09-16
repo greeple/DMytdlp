@@ -15,7 +15,7 @@ jobs:
         shell: cmd
         run: |
           cl /nologo /W3 /EHsc /std:c++17 /MT /DUNICODE /DWIN32 /O2 /LD src\ytdlp_plugin.cpp ^
-             /link /NOLOGO /DEF:src\ytdlp_plugin.def oleaut32.lib /OUT:ytdlp.dll
+             /link /NOLOGO oleaut32.lib /OUT:ytdlp.dll
       - name: Check export
         shell: cmd
         run: dumpbin /exports ytdlp.dll
