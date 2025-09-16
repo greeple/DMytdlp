@@ -1,20 +1,17 @@
 // ytdlp_plugin.cpp
-// Minimal DM plugin (x86) that calls yt-dlp -J, extracts title and fills description.
-//
-// Build: MSVC x86. Link: oleaut32.lib
+// Build: MSVC x86, /MT. Link: oleaut32.lib
 // Place ytdlp.dll into Download Master\Plugins\
-// yt-dlp path: PATH by default; or ytdlp.ini ([ytdlp] path=...) next to the DLL.
 
 #include <windows.h>
 #include <oleauto.h>
 #include <string>
 #include <sstream>
 #include <vector>
-#include <memory>   // for std::unique_ptr
+#include <memory>
 
 #pragma comment(lib, "oleaut32.lib")
 
-// GUIDs from DMPluginIntf.pas
+// GUIDs из DMPluginIntf.pas
 struct __declspec(uuid("B412B405-0578-4B99-BB06-368CDA0B2F8C")) IDMInterface : public IUnknown {
     virtual BSTR __stdcall DoAction(BSTR action, BSTR parameters) = 0;
 };
@@ -34,7 +31,6 @@ struct __declspec(uuid("959CD0D3-83FD-40F7-A75A-E5C6500B58DF")) IDMPlugIn : publ
     virtual BSTR __stdcall EventRaised(BSTR eventType, BSTR eventData) = 0;
 };
 
-// Small helpers
 static inline BSTR ToBSTR(const std::wstring& s) { return SysAllocStringLen(s.data(), (UINT)s.size()); }
 static inline std::wstring FromBSTR(BSTR b)      { return b ? std::wstring(b, SysStringLen(b)) : L""; }
 
@@ -67,7 +63,6 @@ static std::wstring Utf8ToW(const std::string& s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
     if (n <= 0) return L"";
     std::wstring w(n, L'\0');
-    // Изменяемый буфер (&w[0]) — требование API
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
 }
@@ -76,7 +71,6 @@ static std::wstring PathJoin(const std::wstring& a, const std::wstring& b) {
     if (a.back() == L'\\' || a.back() == L'/') return a + b;
     return a + L"\\" + b;
 }
-// CreateProcess + pipe to capture stdout
 static bool RunProcessCapture(const std::wstring& app, const std::wstring& args, std::string& outUtf8, DWORD& exitCode) {
     SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
     HANDLE r = NULL, w = NULL;
@@ -84,8 +78,6 @@ static bool RunProcessCapture(const std::wstring& app, const std::wstring& args,
     if (!SetHandleInformation(r, HANDLE_FLAG_INHERIT, 0)) { CloseHandle(r); CloseHandle(w); return false; }
 
     std::wstring cmd = L"\"" + app + L"\" " + args;
-
-    // CreateProcessW может модифицировать lpCommandLine → нужен изменяемый буфер
     std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
     cmdBuf.push_back(L'\0');
 
@@ -129,55 +121,51 @@ public:
         return r;
     }
 
-    // IDMPlugIn info
-    BSTR __stdcall getID() override {
-        return ToBSTR(L"{F1E5C3A0-8C33-4D4C-8DE0-6B5ACF0F31C5}");
-    }
-    BSTR __stdcall GetName() override        { return ToBSTR(L"ytdlp plugin"); }
-    BSTR __stdcall GetVersion() override     { return ToBSTR(L"0.1.0"); }
+    // Info
+    BSTR __stdcall getID() override             { return ToBSTR(L"{F1E5C3A0-8C33-4D4C-8DE0-6B5ACF0F31C5}"); }
+    BSTR __stdcall GetName() override           { return ToBSTR(L"ytdlp plugin"); }
+    BSTR __stdcall GetVersion() override        { return ToBSTR(L"0.1.0"); }
     BSTR __stdcall GetDescription(BSTR lang) override {
         std::wstring l = FromBSTR(lang);
         if (!_wcsicmp(l.c_str(), L"russian") || !_wcsicmp(l.c_str(), L"ukrainian") || !_wcsicmp(l.c_str(), L"belarusian"))
             return ToBSTR(L"Плагин: пробует yt-dlp -J и заполняет описание.");
         return ToBSTR(L"Plugin: runs yt-dlp -J and fills description.");
     }
-    BSTR __stdcall GetEmail() override       { return ToBSTR(L"dev@example.com"); }
-    BSTR __stdcall GetHomepage() override    { return ToBSTR(L"https://example.com"); }
-    BSTR __stdcall GetCopyright() override   { return ToBSTR(L"\x00A9 2025 Example"); }
-    BSTR __stdcall GetMinAppVersion() override { return ToBSTR(L"5.0.2"); }
+    BSTR __stdcall GetEmail() override          { return ToBSTR(L"dev@example.com"); }
+    BSTR __stdcall GetHomepage() override       { return ToBSTR(L"https://example.com"); }
+    BSTR __stdcall GetCopyright() override      { return ToBSTR(L"\x00A9 2025 Example"); }
+    BSTR __stdcall GetMinAppVersion() override  { return ToBSTR(L"5.0.2"); }
 
     // Lifecycle
     void __stdcall PluginInit(IDMInterface* dm) override {
+        OutputDebugStringW(L"[ytdlp] PluginInit\n");
         if (m_dm) { m_dm->Release(); m_dm = nullptr; }
         m_dm = dm; if (m_dm) m_dm->AddRef();
 
-        // Сохраним папку плагинов из DM, для поиска ytdlp.ini
         m_pluginDir = DoActionW(L"GetPluginDir", L"");
-        if (!m_pluginDir.empty()) {
-            for (auto& ch : m_pluginDir) if (ch == L'/') ch = L'\\';
-        }
+        for (auto& ch : m_pluginDir) if (ch == L'/') ch = L'\\';
     }
     void __stdcall PluginConfigure(BSTR /*params*/) override {
-        // TODO: GUI настроек. Пока ничего.
+        // TODO
     }
     void __stdcall BeforeUnload() override {
+        OutputDebugStringW(L"[ytdlp] BeforeUnload\n");
         if (m_dm) { m_dm->Release(); m_dm = nullptr; }
     }
 
-    // Events
     BSTR __stdcall EventRaised(BSTR eventType, BSTR eventData) override {
         std::wstring et = FromBSTR(eventType);
         std::wstring ed = FromBSTR(eventData);
 
         if (et == L"dm_download_added") {
-            const std::wstring id = ed; // eventData = ID (строка)
+            const std::wstring id = ed;
             const std::wstring info = DoActionW(L"GetDownloadInfoByID", id);
             const std::wstring url  = ExtractXmlField(info, L"url");
 
             if (!url.empty()) {
                 struct Ctx { Plugin* self; std::wstring id, url; };
                 auto* ctx = new Ctx{ this, id, url };
-                AddRef(); // удержать объект до завершения потока
+                AddRef();
 
                 HANDLE h = CreateThread(nullptr, 0,
                     [](LPVOID p)->DWORD {
@@ -185,8 +173,7 @@ public:
                         Plugin* self = ctx->self;
 
                         const std::wstring ytdlpPath = self->GetYtDlpPath();
-                        std::wstring args = L"-J --no-warnings --dump-single-json -- ";
-                        args += L"\"" + ctx->url + L"\"";
+                        std::wstring args = L"-J --no-warnings --dump-single-json -- \"" + ctx->url + L"\"";
 
                         std::string outUtf8; DWORD code = 0;
                         bool ok = RunProcessCapture(ytdlpPath, args, outUtf8, code);
@@ -194,16 +181,14 @@ public:
                         std::wstring title;
                         if (ok && code == 0 && !outUtf8.empty()) {
                             std::wstring jsonW = Utf8ToW(outUtf8);
-                            // Наивно вытащим "title":"..."; позже заменить на нормальный JSON-парсер
                             size_t k = jsonW.find(L"\"title\"");
                             if (k != std::wstring::npos) {
                                 k = jsonW.find(L":", k);
                                 if (k != std::wstring::npos) {
                                     size_t q1 = jsonW.find(L"\"", k + 1);
                                     size_t q2 = (q1 != std::wstring::npos) ? jsonW.find(L"\"", q1 + 1) : std::wstring::npos;
-                                    if (q1 != std::wstring::npos && q2 != std::wstring::npos && q2 > q1) {
+                                    if (q1 != std::wstring::npos && q2 != std::wstring::npos && q2 > q1)
                                         title = jsonW.substr(q1 + 1, q2 - q1 - 1);
-                                    }
                                 }
                             }
                         }
@@ -222,7 +207,7 @@ public:
                     ctx, 0, nullptr);
 
                 if (h) CloseHandle(h);
-                else Release(); // если поток не стартовал — отпустить ссылку
+                else Release();
             }
         }
 
@@ -241,9 +226,7 @@ private:
         if (r) SysFreeString(r);
         return s;
     }
-
     std::wstring GetYtDlpPath() const {
-        // Если есть ini рядом с плагином — читаем путь
         if (!m_pluginDir.empty()) {
             const std::wstring ini = PathJoin(m_pluginDir, L"ytdlp.ini");
             DWORD attrs = GetFileAttributesW(ini.c_str());
@@ -253,7 +236,6 @@ private:
                 if (n > 0) return std::wstring(buf, n);
             }
         }
-        // Иначе — из PATH
         return L"yt-dlp.exe";
     }
 
@@ -263,9 +245,19 @@ private:
     std::wstring  m_pluginDir;
 };
 
-// Export DM looks for
-extern "C" __declspec(dllexport) IDMPlugIn* __stdcall RegisterPlugIn() {
-    return new Plugin();
+// ВАЖНО: экспорт только через .def
+extern "C" IDMPlugIn* __stdcall RegisterPlugIn() {
+    OutputDebugStringW(L"[ytdlp] RegisterPlugIn called\n");
+    try {
+        return new Plugin();
+    } catch (...) {
+        return nullptr;
+    }
 }
 
-BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) { return TRUE; }
+BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        OutputDebugStringW(L"[ytdlp] DllMain attach\n");
+    }
+    return TRUE;
+}
