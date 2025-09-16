@@ -1,0 +1,28 @@
+name: build-ytdlp-plugin
+on: [push, pull_request]
+
+jobs:
+  msvc-x86:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build DLL
+        shell: cmd
+        run: |
+          cl /nologo /W3 /EHsc /MD /DUNICODE /DWIN32 /O2 /LD src\ytdlp_plugin.cpp ^
+             /link /NOLOGO /DEF:src\ytdlp_plugin.def oleaut32.lib /OUT:ytdlp.dll
+
+      - name: Check export
+        shell: cmd
+        run: dumpbin /exports ytdlp.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ytdlp-plugin-x86
+          path: ytdlp.dll
