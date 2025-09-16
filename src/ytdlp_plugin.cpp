@@ -10,6 +10,7 @@
 #include <string>
 #include <sstream>
 #include <vector>
+#include <memory>   // for std::unique_ptr
 
 #pragma comment(lib, "oleaut32.lib")
 
@@ -63,9 +64,11 @@ static std::wstring ExtractXmlField(const std::wstring& xml, const std::wstring&
 }
 static std::wstring Utf8ToW(const std::string& s) {
     if (s.empty()) return L"";
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    std::wstring w(n, 0);
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return L"";
+    std::wstring w(n, L'\0');
+    // Изменяемый буфер (&w[0]) — требование API
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
 }
 static std::wstring PathJoin(const std::wstring& a, const std::wstring& b) {
@@ -82,13 +85,17 @@ static bool RunProcessCapture(const std::wstring& app, const std::wstring& args,
 
     std::wstring cmd = L"\"" + app + L"\" " + args;
 
+    // CreateProcessW может модифицировать lpCommandLine → нужен изменяемый буфер
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+
     STARTUPINFOW si{}; si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
     si.hStdOutput = w; si.hStdError = w;
 
     PROCESS_INFORMATION pi{};
-    BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    BOOL ok = CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
     CloseHandle(w);
     if (!ok) { CloseHandle(r); return false; }
 
@@ -124,7 +131,6 @@ public:
 
     // IDMPlugIn info
     BSTR __stdcall getID() override {
-        // Сгенерируй свой GUID при необходимости
         return ToBSTR(L"{F1E5C3A0-8C33-4D4C-8DE0-6B5ACF0F31C5}");
     }
     BSTR __stdcall GetName() override        { return ToBSTR(L"ytdlp plugin"); }
@@ -148,11 +154,7 @@ public:
         // Сохраним папку плагинов из DM, для поиска ytdlp.ini
         m_pluginDir = DoActionW(L"GetPluginDir", L"");
         if (!m_pluginDir.empty()) {
-            // Нормализуем слэш
             for (auto& ch : m_pluginDir) if (ch == L'/') ch = L'\\';
-            if (!m_pluginDir.empty() && (m_pluginDir.back() == L'\\' || m_pluginDir.back() == L'/')) {
-                // ок
-            }
         }
     }
     void __stdcall PluginConfigure(BSTR /*params*/) override {
@@ -173,7 +175,6 @@ public:
             const std::wstring url  = ExtractXmlField(info, L"url");
 
             if (!url.empty()) {
-                // Запуск в фоне, чтобы не блокировать DM
                 struct Ctx { Plugin* self; std::wstring id, url; };
                 auto* ctx = new Ctx{ this, id, url };
                 AddRef(); // удержать объект до завершения потока
@@ -221,6 +222,7 @@ public:
                     ctx, 0, nullptr);
 
                 if (h) CloseHandle(h);
+                else Release(); // если поток не стартовал — отпустить ссылку
             }
         }
 
@@ -230,7 +232,7 @@ public:
 private:
     ~Plugin() { if (m_dm) { m_dm->Release(); m_dm = nullptr; } }
 
-    std::wstring DoActionW(const std::wstring& action, const std::wstring& params) {
+    std::wstring DoActionW(const std::wstring& action, const std::wstring& params) const {
         if (!m_dm) return L"";
         BSTR a = ToBSTR(action), p = ToBSTR(params);
         BSTR r = m_dm->DoAction(a, p);
