@@ -1,5 +1,6 @@
 name: build-ytdlp-plugin
-on: [push, pull_request]
+on:
+ workflow_dispatch:
 
 jobs:
   msvc-x86:
