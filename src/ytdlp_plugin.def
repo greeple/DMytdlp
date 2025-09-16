@@ -1,0 +1,3 @@
+LIBRARY ytdlp
+EXPORTS
+  RegisterPlugIn=RegisterPlugIn@0
