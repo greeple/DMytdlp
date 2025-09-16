@@ -3,7 +3,7 @@ on: [push, pull_request]
 
 jobs:
   msvc-x86:
-    runs-on: windows-2022
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -15,7 +15,7 @@ jobs:
       - name: Build DLL
         shell: cmd
         run: |
-          cl /nologo /W3 /EHsc /MD /DUNICODE /DWIN32 /O2 /LD src\ytdlp_plugin.cpp ^
+          cl /nologo /W3 /EHsc /std:c++17 /MD /DUNICODE /DWIN32 /O2 /LD src\ytdlp_plugin.cpp ^
              /link /NOLOGO /DEF:src\ytdlp_plugin.def oleaut32.lib /OUT:ytdlp.dll
 
       - name: Check export
