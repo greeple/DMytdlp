@@ -161,10 +161,12 @@ static ULONG __stdcall PI_Release(void* self) {
 }
 
 static void SetRet(BSTR* ret, const std::wstring& s){ if (ret) *ret = SysAllocStringLen(s.data(), (UINT)s.size()); }
-static void __stdcall PI_getID(BSTR* ret, void*)            { SetRet(ret, L"{F1E5C3A0-8C33-4D4C-8DE0-6B5ACF0F31C5}"); }
-static void __stdcall PI_GetName(BSTR* ret, void*)          { SetRet(ret, L"ytdlp plugin"); }
-static void __stdcall PI_GetVersion(BSTR* ret, void*)       { SetRet(ret, L"0.1.0"); }
+static void __stdcall PI_getID(BSTR* ret, void*)            { WriteMarker(L"ytdlp_getID.txt"); SetRet(ret, L"{F1E5C3A0-8C33-4D4C-8DE0-6B5ACF0F31C5}"); }
+static void __stdcall PI_GetName(BSTR* ret, void*)          { WriteMarker(L"ytdlp_GetName.txt"); SetRet(ret, L"ytdlp plugin"); }
+static void __stdcall PI_GetVersion(BSTR* ret, void*)       { WriteMarker(L"ytdlp_GetVersion.txt"); SetRet(ret, L"0.1.0"); }
+static void __stdcall PI_GetMinAppVersion(BSTR* ret, void*) { WriteMarker(L"ytdlp_GetMinAppVersion.txt"); SetRet(ret, L"5.0.2"); }
 static void __stdcall PI_GetDescription(BSTR* ret, void*, BSTR lang) {
+    WriteMarker(L"ytdlp_GetDescription.txt");
     std::wstring l = lang ? std::wstring(lang, SysStringLen(lang)) : L"";
     if (!_wcsicmp(l.c_str(), L"russian") || !_wcsicmp(l.c_str(), L"ukrainian") || !_wcsicmp(l.c_str(), L"belarusian"))
         SetRet(ret, L"Плагин: пробует yt-dlp и заполняет описание.");
@@ -209,7 +211,9 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
     auto* o = (PlugInObj*)self;
     std::wstring et = eventType ? std::wstring(eventType, SysStringLen(eventType)) : L"";
     std::wstring ed = eventData ? std::wstring(eventData, SysStringLen(eventData)) : L"";
-
+if (et == L"dm_timer_5") {
+    WriteMarker(L"ytdlp_ev_dm_timer_5.txt");
+}
     if (!et.empty()) WriteMarker(std::wstring(L"ytdlp_ev_") + et + L".txt");
 
     if (et == L"dm_download_added" && o && o->dm) {
