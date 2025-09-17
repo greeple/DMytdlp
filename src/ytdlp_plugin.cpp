@@ -277,6 +277,8 @@ static void __stdcall PI_BeforeUnload(void*) { WriteMarker(L"ytdlp_BeforeUnload.
 static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR eventData) {
     if (ret) *ret = SysAllocString(L"");
     auto* o = (PlugInObj*)self;
+    if (!o || !o->dm) return;
+
     std::wstring et = BSTRtoW(eventType);
     std::wstring ed = BSTRtoW(eventData);
 
@@ -285,75 +287,56 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
         AppendTrace(L"[Event] " + et + L" | " + ed);
     }
 
-    if (!o || !o->dm) return;
-
+    // Универсально выдёргиваем ID из начала строки
     auto getIdStr = [&](const std::wstring& s)->std::wstring {
         int id = 0;
         if (!ParseLeadingInt(s, id)) return L"";
         return std::to_wstring(id);
     };
 
-    // dm_download_added
+    // 1) dm_download_added: просто прочитаем info и попробуем поставить «[ytdlp] test» в description
     if (et.find(L"dm_download_added") != std::wstring::npos) {
-        AppendTrace(L"[Match] added");
         const std::wstring id = getIdStr(ed);
-        if (id.empty()) { AppendTrace(L"[ParseID] FAIL on added"); return; }
+        if (id.empty()) { AppendTrace(L"[Added] ParseID FAIL"); return; }
+        AppendTrace(L"[Added] id=" + id);
 
+        // Читаем info
         std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", id);
-        AppendTrace(L"[InfoOnAdded] " + std::to_wstring(info.size()) + L" bytes");
-        if (info.empty()) return;
+        AppendTrace(L"[Added] info_len=" + std::to_wstring(info.size()));
 
-        AddLog(o, id, 2, L"[ytdlp] dm_download_added");
+        // Пробуем установить тестовое описание
+        std::wstring patch = L"<id>" + id + L"</id><description>[ytdlp] test</description>";
+        std::wstring setRes = DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
+        AppendTrace(L"[Added] set_desc_len=" + std::to_wstring(setRes.size()));
 
-        std::wstring url = ExtractTag(info, L"url");
-        if (url.empty()) { AddLog(o, id, 3, L"[ytdlp] empty url"); return; }
-
-        std::wstring args = L"-e --no-warnings -- \"" + url + L"\"";
-        std::string out; DWORD ec = 0;
-        bool ok = RunProcessCapture(o->ytdlpPath.empty() ? L"yt-dlp.exe" : o->ytdlpPath, args, out, ec);
-        if (!ok || ec != 0 || out.empty()) { AddLog(o, id, 3, L"[ytdlp] probe failed"); return; }
-
-        while (!out.empty() && (out.back() == '\r' || out.back() == '\n')) out.pop_back();
-        std::wstring title = Utf8ToW(out);
-        if (title.empty()) { AddLog(o, id, 3, L"[ytdlp] empty title"); return; }
-
-        std::wstring patch = L"<id>" + id + L"</id><description>" + XmlEscape(title) + L" [yt-dlp]</description>";
-        DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
-        AddLog(o, id, 2, L"[ytdlp] title set");
         return;
     }
 
-    // dm_download_state (fallback)
+    // 2) dm_download_state: если state==3 — делаем то же самое (чтение info и установка «[ytdlp] test(state)»)
     if (et.find(L"dm_download_state") != std::wstring::npos) {
-        AppendTrace(L"[Match] state");
         int id = 0, state = 0;
         {
             const wchar_t* p = ed.c_str(); wchar_t* end = nullptr;
             long v1 = wcstol(p, &end, 10);
-            if (p == end) return; id = (int)v1;
-            if (*end) { const wchar_t* p2 = end; long v2 = wcstol(p2, nullptr, 10); state = (int)v2; }
+            if (p == end) { AppendTrace(L"[State] ParseID FAIL"); return; }
+            id = (int)v1;
+            if (*end) {
+                const wchar_t* p2 = end;
+                long v2 = wcstol(p2, nullptr, 10);
+                state = (int)v2;
+            }
         }
-        if (state == 3 && id > 0) {
+        AppendTrace(L"[State] id=" + std::to_wstring(id) + L" state=" + std::to_wstring(state));
+        if (id <= 0) return;
+
+        if (state == 3) {
             std::wstring sid = std::to_wstring(id);
             std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", sid);
-            AppendTrace(L"[InfoOnState] " + std::to_wstring(info.size()) + L" bytes");
-            if (info.empty()) return;
+            AppendTrace(L"[State3] info_len=" + std::to_wstring(info.size()));
 
-            std::wstring url = ExtractTag(info, L"url");
-            if (url.empty()) return;
-
-            std::wstring args = L"-e --no-warnings -- \"" + url + L"\"";
-            std::string out; DWORD ec = 0;
-            bool ok = RunProcessCapture(o->ytdlpPath.empty() ? L"yt-dlp.exe" : o->ytdlpPath, args, out, ec);
-            if (!ok || ec != 0 || out.empty()) return;
-
-            while (!out.empty() && (out.back() == '\r' || out.back() == '\n')) out.pop_back();
-            std::wstring title = Utf8ToW(out);
-            if (title.empty()) return;
-
-            std::wstring patch = L"<id>" + sid + L"</id><description>" + XmlEscape(title) + L" [yt-dlp]</description>";
-            DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
-            AddLog(o, sid, 2, L"[ytdlp] title set (state)");
+            std::wstring patch = L"<id>" + sid + L"</id><description>[ytdlp] test(state)</description>";
+            std::wstring setRes = DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
+            AppendTrace(L"[State3] set_desc_len=" + std::to_wstring(setRes.size()));
         }
         return;
     }
