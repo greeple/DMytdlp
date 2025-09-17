@@ -1,7 +1,6 @@
 name: build-ytdlp-plugin
 on:
  workflow_dispatch:
-
 jobs:
   msvc-x86:
     runs-on: windows-latest
