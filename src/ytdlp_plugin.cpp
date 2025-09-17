@@ -143,18 +143,14 @@ static std::wstring JsonUnescape(const std::wstring& s) {
                 if (h1<0||h2<0||h3<0||h4<0) { out += L'?'; break; }
                 wchar_t w = (wchar_t)((h1<<12)|(h2<<8)|(h3<<4)|h4);
                 i += 4;
-                // суррогаты
                 if (w >= 0xD800 && w <= 0xDBFF) {
                     if (i + 6 < s.size() && s[i+1] == L'\\' && s[i+2] == L'u') {
                         int h5=HexVal(s[i+3]), h6=HexVal(s[i+4]), h7=HexVal(s[i+5]), h8=HexVal(s[i+6]);
                         wchar_t w2 = (wchar_t)((h5<<12)|(h6<<8)|(h7<<4)|h8);
-                        if (w2 >= 0xDC00 && w2 <= 0xDFFF) {
-                            out += w; out += w2; i += 6; break;
-                        }
+                        if (w2 >= 0xDC00 && w2 <= 0xDFFF) { out += w; out += w2; i += 6; break; }
                     }
                 }
-                out += w;
-                break;
+                out += w; break;
             }
             default: out += n; break;
         }
@@ -305,14 +301,14 @@ static void __stdcall PI_GetName(BSTR* ret, void*)          { WriteMarker(L"ytdl
 static void __stdcall PI_GetVersion(BSTR* ret, void*)       { WriteMarker(L"ytdlp_GetVersion.txt");       SetRet(ret, L"0.1.0"); }
 static void __stdcall PI_GetDescription(BSTR* ret, void*, BSTR /*language*/) {
     WriteMarker(L"ytdlp_GetDescription.txt");
-    SetRet(ret, L"YTDLP test plugin (fills title via yt-dlp).");
+    SetRet(ret, L"YTDLP test plugin (resolves video via yt-dlp).");
 }
 static void __stdcall PI_GetEmail(BSTR* ret, void*)         { WriteMarker(L"ytdlp_GetEmail.txt");         SetRet(ret, L"dev@example.com"); }
 static void __stdcall PI_GetHomepage(BSTR* ret, void*)      { WriteMarker(L"ytdlp_GetHomepage.txt");      SetRet(ret, L"https://example.com"); }
 static void __stdcall PI_GetCopyright(BSTR* ret, void*)     { WriteMarker(L"ytdlp_GetCopyright.txt");     SetRet(ret, L"\x00A9 2025 Example"); }
 static void __stdcall PI_GetMinAppVersion(BSTR* ret, void*) { WriteMarker(L"ytdlp_GetMinAppVersion.txt"); SetRet(ret, L"5.0.2"); }
 
-// AddRef на DM-интерфейс в PluginInit, Release в BeforeUnload — для фоновых потоков
+// Init/Configure/Unload
 static void __stdcall PI_PluginInit(void* self, void* dmInterface) {
     WriteMarker(L"ytdlp_PluginInit.txt");
     auto* o = (PlugInObj*)self;
@@ -344,10 +340,7 @@ static void __stdcall PI_BeforeUnload(void* self) {
 }
 
 // ---------- Worker (фоновая задача) ----------
-struct TaskCtx {
-    PlugInObj* o;
-    std::wstring id;
-};
+struct TaskCtx { PlugInObj* o; std::wstring id; };
 
 static DWORD WINAPI WorkerProc(LPVOID param) {
     std::unique_ptr<TaskCtx> ctx(reinterpret_cast<TaskCtx*>(param));
@@ -357,18 +350,17 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
     InterlockedIncrement(&o->ref);
     AppendTrace(L"[Worker] start id=" + ctx->id);
 
-    // 1) info
+    // info
     std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", ctx->id);
     AppendTrace(L"[Worker] info_len=" + std::to_wstring(info.size()));
     if (info.empty()) { AppendTrace(L"[Worker] no info"); InterlockedDecrement(&o->ref); return 0; }
 
-    // 2) url, savepath, filename
     std::wstring url = ExtractTag(info, L"url");
     std::wstring savepath = ExtractTag(info, L"savepath");
     std::wstring filename = ExtractTag(info, L"filename");
     if (url.empty()) { AppendTrace(L"[Worker] no url"); InterlockedDecrement(&o->ref); return 0; }
 
-    // 3) title из JSON
+    // title
     std::wstring app = o->ytdlpPath.empty() ? L"yt-dlp.exe" : o->ytdlpPath;
     std::wstring argsJ = L"-J --no-warnings --dump-single-json -- \"" + url + L"\"";
     std::string outJ; DWORD ecJ = 0;
@@ -391,7 +383,7 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
     }
     AppendTrace(L"[Worker] title=\"" + title + L"\"");
 
-    // 4) попробуем получить прямой URL (прогрессивный) — одна строка
+    // прямой прогрессивный URL
     std::wstring argsG = L"-g -f \"best[acodec!=none][vcodec!=none][protocol!=m3u8][protocol!=http_dash_segments]/best\" --no-warnings -- \"" + url + L"\"";
     std::string outG; DWORD ecG=0;
     bool okG = RunProcessCapture(app, argsG, outG, ecG);
@@ -399,13 +391,10 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
 
     std::wstring directUrl;
     if (okG && ecG==0 && !outG.empty()) {
-        // split by lines
-        size_t pos=0; int lines=0;
-        std::wstring lastLine;
+        size_t pos=0; int lines=0; std::wstring lastLine;
         while (pos < outG.size()) {
             size_t nl = outG.find('\n', pos);
             std::string line = outG.substr(pos, (nl==std::string::npos? outG.size():nl)-pos);
-            // trim \r
             if (!line.empty() && line.back()=='\r') line.pop_back();
             if (!line.empty()) { ++lines; lastLine = Utf8ToW(line); }
             if (nl==std::string::npos) break;
@@ -415,41 +404,46 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
         AppendTrace(L"[Worker] lines=" + std::to_wstring(lines) + L" direct=" + (directUrl.empty()?L"NO":L"YES"));
     }
 
-    // 5) если есть direct — подменим URL и рестартуем DM
     if (!directUrl.empty()) {
-        // referer — исходный url, часто нужен
-        std::wstring patch = L"<id>" + ctx->id + L"</id>"
-                             L"<url>" + XmlEscape(directUrl) + L"</url>"
-                             L"<referer>" + XmlEscape(url) + L"</referer>"
-                             L"<description>" + XmlEscape(title.empty()?L"[yt-dlp]":title + L" [yt-dlp]") + L"</description>";
-        DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
-        AppendTrace(L"[Worker] direct url set, restarting DM");
-        DM_DoAction(o->dm, L"StartDownloads", ctx->id);
+        // Добавляем новую запись через AddingURL
+        auto sanitize = [](std::wstring s){
+            for (auto& ch: s) if (wcschr(L"<>:\"/\\|?*", ch)) ch = L'_';
+            return s;
+        };
+        std::wstring newFilename = filename; // можно заменить на title + .ext (по желанию)
+        std::wstring desc = title.empty()? L"[yt-dlp]" : title + L" [yt-dlp]";
+        std::wstring params = L"<url>"+XmlEscape(directUrl)+L"</url> "
+                              L"<referer>"+XmlEscape(url)+L"</referer> "
+                              L"<description>"+XmlEscape(desc)+L"</description> ";
+        if (!savepath.empty())  params += L"<savepath>"+XmlEscape(savepath)+L"</savepath> ";
+        if (!newFilename.empty()) params += L"<filename>"+XmlEscape(sanitize(newFilename))+L"</filename> ";
+        params += L"<start>1</start>";
+
+        DM_DoAction(o->dm, L"AddingURL", params);
+        AppendTrace(L"[Worker] AddingURL (direct) done");
+        // старую оставим остановленной
+        DM_DoAction(o->dm, L"StopDownloads", ctx->id);
         InterlockedDecrement(&o->ref);
         return 0;
     }
 
-    // 6) иначе — делегируем внешнему yt-dlp (не ждём). Ставим описание.
-    if (!savepath.empty() && !filename.empty()) {
-        // Правим недопустимые символы в имени (на всякий)
+    // Fallback — внешний yt-dlp
+    if (!savepath.empty()) {
         auto sanitize = [](std::wstring s){
-            for (auto& ch: s) {
-                if (ch==L'<'||ch==L'>'||ch==L':'||ch==L'"'||ch==L'/'||ch==L'\\'||ch==L'|'||ch==L'?'||ch==L'*')
-                    ch=L'_';
-            }
+            for (auto& ch: s) if (wcschr(L"<>:\"/\\|?*", ch)) ch = L'_';
             return s;
         };
-        std::wstring outBase = PathJoin(savepath, sanitize(filename));
-        // Пусть yt-dlp сам добавит расширение по формату
+        std::wstring outBase = PathJoin(savepath, sanitize(filename.empty()? L"video" : filename));
         std::wstring argsDl = L"-f best --merge-output-format mp4 --no-warnings --no-progress -o \"" + outBase + L".%(ext)s\" -- \"" + url + L"\"";
         RunProcessDetached(app, argsDl);
-        // Обновим описание
-        std::wstring desc = title.empty()? L"[yt-dlp] external" : title + L" [yt-dlp] (external)";
-        std::wstring patchDesc = L"<id>" + ctx->id + L"</id><description>" + XmlEscape(desc) + L"</description>";
-        DM_DoAction(o->dm, L"SetDownloadInfoByID", patchDesc);
+
+        std::wstring desc = title.empty()? L"[yt-dlp] (external)" : title + L" [yt-dlp] (external)";
+        // Создаём запись-«заглушку» или просто логируем:
+        DM_DoAction(o->dm, L"AddStringToLog",
+            L"<id>"+ctx->id+L"</id><type>2</type><logstring>"+XmlEscape(L"[ytdlp] external download launched") + L"</logstring>");
         AppendTrace(L"[Worker] external yt-dlp launched");
     } else {
-        AppendTrace(L"[Worker] no savepath/filename for external dl");
+        AppendTrace(L"[Worker] no savepath; external skipped");
     }
 
     InterlockedDecrement(&o->ref);
@@ -495,20 +489,19 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
         AppendTrace(L"[State] id=" + sid + L" state=" + std::to_wstring(state));
 
         if (state == 3) {
-            // Пропускаем не-видео: читаем info и смотрим URL
+            // Проверим URL и уже обработанную запись
             std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", sid);
-            std::wstring url  = ExtractTag(info, L"url");
-            if (url.empty() || !IsVideoSite(url)) {
-                AppendTrace(L"[State3] skip non-video");
-                return;
-            }
-            // Если уже проставили ранее
             if (info.find(L"[yt-dlp]") != std::wstring::npos) {
                 AppendTrace(L"[State3] already processed");
                 return;
             }
+            std::wstring url = ExtractTag(info, L"url");
+            if (url.empty() || !IsVideoSite(url)) {
+                AppendTrace(L"[State3] skip non-video");
+                return;
+            }
 
-            // Стоп DM, запустить воркер, пусть подменит URL или делегирует
+            // Стоп — и в воркер
             DM_DoAction(o->dm, L"StopDownloads", sid);
             AppendTrace(L"[State3] StopDownloads sent; start worker");
             StartWorker(o, sid);
