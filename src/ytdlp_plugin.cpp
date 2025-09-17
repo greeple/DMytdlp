@@ -1,5 +1,5 @@
 #include <windows.h>
-#include <oleauto.h>
+#include <oleaut32.h>
 #include <string>
 #include <vector>
 
@@ -48,14 +48,14 @@ static void AppendTrace(const std::wstring& line) {
     }
     std::wstring path = std::wstring(dir) + L"ytdlp_trace.txt";
 
-    // Проверим размер (для BOM)
+    // Создадим файл и при необходимости запишем BOM
     WIN32_FILE_ATTRIBUTE_DATA fad{};
-    bool isNewFile = !GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad);
+    bool newFile = !GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad);
 
     HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
 
-    if (isNewFile) {
+    if (newFile) {
         static const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
         DWORD wr; WriteFile(h, bom, 3, &wr, nullptr);
     }
@@ -74,6 +74,7 @@ static bool ParseLeadingInt(const std::wstring& s, int& out) {
     out = (int)v;
     return true;
 }
+
 static std::wstring XmlEscape(const std::wstring& in) {
     std::wstring out; out.reserve(in.size() + 16);
     for (wchar_t c : in) {
@@ -88,11 +89,13 @@ static std::wstring XmlEscape(const std::wstring& in) {
     }
     return out;
 }
+
 static std::wstring PathJoin(const std::wstring& a, const std::wstring& b) {
     if (a.empty()) return b;
     if (a.back() == L'\\' || a.back() == L'/') return a + b;
     return a + L"\\" + b;
 }
+
 static std::wstring ExtractTag(const std::wstring& xml, const wchar_t* t) {
     std::wstring open = L"<"; open += t; open += L">";
     std::wstring close = L"</"; close += t; close += L">";
@@ -117,6 +120,7 @@ static std::wstring DM_DoAction(void* pDm, const std::wstring& a, const std::wst
     if (!pDm) return L"";
     auto* dm = reinterpret_cast<DMInterface*>(pDm);
     if (!dm->lpVtbl || !dm->lpVtbl->DoAction) return L"";
+
     // логируем, что отправляем
     std::wstring pLog = p.substr(0, 512);
     AppendTrace(L"[DoAction] action=\"" + a + L"\" params=\"" + pLog + L"\"");
@@ -168,6 +172,7 @@ static bool RunProcessCapture(const std::wstring& app, const std::wstring& args,
     AppendTrace(L"[RunAppExit] code=" + std::to_wstring(exitCode));
     return true;
 }
+
 static std::wstring Utf8ToW(const std::string& s) {
     if (s.empty()) return L"";
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
@@ -175,6 +180,7 @@ static std::wstring Utf8ToW(const std::string& s) {
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
 }
+
 static std::wstring ReadIniYtDlp(const std::wstring& dir) {
     if (dir.empty()) return L"yt-dlp.exe";
     std::wstring ini = PathJoin(dir, L"ytdlp.ini");
@@ -208,6 +214,7 @@ struct PlugInVtbl {
     void (__stdcall* BeforeUnload)(void* self);
     void (__stdcall* EventRaised)(BSTR* ret, void* self, BSTR eventType, BSTR eventData);
 };
+
 struct PlugInObj {
     PlugInVtbl* lpVtbl;
     volatile LONG ref;
@@ -254,11 +261,15 @@ static void __stdcall PI_GetHomepage(BSTR* ret, void*)      { WriteMarker(L"ytdl
 static void __stdcall PI_GetCopyright(BSTR* ret, void*)     { WriteMarker(L"ytdlp_GetCopyright.txt");     SetRet(ret, L"\x00A9 2025 Example"); }
 static void __stdcall PI_GetMinAppVersion(BSTR* ret, void*) { WriteMarker(L"ytdlp_GetMinAppVersion.txt"); SetRet(ret, L"5.0.2"); }
 
-// Init/Configure/Unload
+// AddRef на DM-интерфейс в PluginInit, Release в BeforeUnload — для фоновых потоков
 static void __stdcall PI_PluginInit(void* self, void* dmInterface) {
     WriteMarker(L"ytdlp_PluginInit.txt");
     auto* o = (PlugInObj*)self;
     o->dm = dmInterface;
+    if (o->dm) {
+        auto* dm = reinterpret_cast<DMInterface*>(o->dm);
+        if (dm->lpVtbl && dm->lpVtbl->AddRef) dm->lpVtbl->AddRef(o->dm);
+    }
 
     o->pluginDir = DM_DoAction(o->dm, L"GetPluginDir", L"");
     for (auto& ch : o->pluginDir) if (ch == L'/') ch = L'\\';
@@ -271,9 +282,93 @@ static void __stdcall PI_PluginConfigure(void*, BSTR /*params*/) {
     WriteMarker(L"ytdlp_PluginConfigure.txt");
     MessageBoxW(nullptr, L"YTDLP plugin settings (stub)", L"ytdlp", MB_OK | MB_ICONINFORMATION);
 }
-static void __stdcall PI_BeforeUnload(void*) { WriteMarker(L"ytdlp_BeforeUnload.txt"); }
+static void __stdcall PI_BeforeUnload(void* self) {
+    WriteMarker(L"ytdlp_BeforeUnload.txt");
+    auto* o = (PlugInObj*)self;
+    if (o->dm) {
+        auto* dm = reinterpret_cast<DMInterface*>(o->dm);
+        if (dm->lpVtbl && dm->lpVtbl->Release) dm->lpVtbl->Release(o->dm);
+        o->dm = nullptr;
+    }
+}
 
-// События
+// ---------- Worker (фоновая задача) ----------
+struct TaskCtx {
+    PlugInObj* o;
+    std::wstring id;
+    bool fromState;
+};
+
+static DWORD WINAPI WorkerProc(LPVOID param) {
+    std::unique_ptr<TaskCtx> ctx(reinterpret_cast<TaskCtx*>(param));
+    PlugInObj* o = ctx->o;
+    if (!o || !o->dm) return 0;
+
+    // держим плагин живым на время
+    InterlockedIncrement(&o->ref);
+
+    AppendTrace(L"[Worker] start id=" + ctx->id + (ctx->fromState ? L" [state]" : L" [added]"));
+
+    // 1) получить info
+    std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", ctx->id);
+    AppendTrace(L"[Worker] info_len=" + std::to_wstring(info.size()));
+    if (info.empty()) {
+        AppendTrace(L"[Worker] no info");
+        InterlockedDecrement(&o->ref);
+        return 0;
+    }
+
+    // 2) достать URL
+    std::wstring url = ExtractTag(info, L"url");
+    if (url.empty()) {
+        AppendTrace(L"[Worker] no url");
+        InterlockedDecrement(&o->ref);
+        return 0;
+    }
+
+    // 3) yt-dlp -e (title)
+    std::wstring app = o->ytdlpPath.empty() ? L"yt-dlp.exe" : o->ytdlpPath;
+    std::wstring args = L"-e --no-warnings -- \"" + url + L"\"";
+    std::string out; DWORD ec = 0;
+    bool ok = RunProcessCapture(app, args, out, ec);
+    if (!ok || ec != 0 || out.empty()) {
+        AppendTrace(L"[Worker] yt-dlp failed code=" + std::to_wstring(ec));
+        InterlockedDecrement(&o->ref);
+        return 0;
+    }
+    while (!out.empty() && (out.back()=='\r' || out.back()=='\n')) out.pop_back();
+    std::wstring title = Utf8ToW(out);
+    AppendTrace(L"[Worker] title=\"" + title + L"\"");
+    if (title.empty()) {
+        InterlockedDecrement(&o->ref);
+        return 0;
+    }
+
+    // 4) поставить описание
+    std::wstring patch = L"<id>" + ctx->id + L"</id><description>" + XmlEscape(title) + L" [yt-dlp]</description>";
+    std::wstring setRes = DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
+    AppendTrace(L"[Worker] set_desc_len=" + std::to_wstring(setRes.size()));
+
+    // 5) в лог DM
+    std::wstring logmsg = ctx->fromState ? L"[ytdlp] title set (state)" : L"[ytdlp] title set";
+    std::wstring logxml = L"<id>" + ctx->id + L"</id><type>2</type><logstring>" + XmlEscape(logmsg) + L"</logstring>";
+    DM_DoAction(o->dm, L"AddStringToLog", logxml);
+
+    InterlockedDecrement(&o->ref);
+    return 0;
+}
+
+static void StartWorker(PlugInObj* o, const std::wstring& id, bool fromState) {
+    auto* ctx = new TaskCtx{ o, id, fromState };
+    HANDLE h = CreateThread(nullptr, 0, WorkerProc, ctx, 0, nullptr);
+    if (h) CloseHandle(h);
+    else {
+        AppendTrace(L"[Worker] CreateThread FAIL");
+        delete ctx;
+    }
+}
+
+// События (без таймеров)
 static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR eventData) {
     if (ret) *ret = SysAllocString(L"");
     auto* o = (PlugInObj*)self;
@@ -282,37 +377,25 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
     std::wstring et = BSTRtoW(eventType);
     std::wstring ed = BSTRtoW(eventData);
 
-    // Не засоряем trace таймерами
+    // Не пишем таймеры в trace
     if (et.rfind(L"dm_timer_", 0) != 0) {
         AppendTrace(L"[Event] " + et + L" | " + ed);
     }
 
-    // Универсально выдёргиваем ID из начала строки
     auto getIdStr = [&](const std::wstring& s)->std::wstring {
         int id = 0;
         if (!ParseLeadingInt(s, id)) return L"";
         return std::to_wstring(id);
     };
 
-    // 1) dm_download_added: просто прочитаем info и попробуем поставить «[ytdlp] test» в description
     if (et.find(L"dm_download_added") != std::wstring::npos) {
-        const std::wstring id = getIdStr(ed);
+        std::wstring id = getIdStr(ed);
         if (id.empty()) { AppendTrace(L"[Added] ParseID FAIL"); return; }
         AppendTrace(L"[Added] id=" + id);
-
-        // Читаем info
-        std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", id);
-        AppendTrace(L"[Added] info_len=" + std::to_wstring(info.size()));
-
-        // Пробуем установить тестовое описание
-        std::wstring patch = L"<id>" + id + L"</id><description>[ytdlp] test</description>";
-        std::wstring setRes = DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
-        AppendTrace(L"[Added] set_desc_len=" + std::to_wstring(setRes.size()));
-
+        StartWorker(o, id, false);
         return;
     }
 
-    // 2) dm_download_state: если state==3 — делаем то же самое (чтение info и установка «[ytdlp] test(state)»)
     if (et.find(L"dm_download_state") != std::wstring::npos) {
         int id = 0, state = 0;
         {
@@ -327,16 +410,8 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
             }
         }
         AppendTrace(L"[State] id=" + std::to_wstring(id) + L" state=" + std::to_wstring(state));
-        if (id <= 0) return;
-
-        if (state == 3) {
-            std::wstring sid = std::to_wstring(id);
-            std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", sid);
-            AppendTrace(L"[State3] info_len=" + std::to_wstring(info.size()));
-
-            std::wstring patch = L"<id>" + sid + L"</id><description>[ytdlp] test(state)</description>";
-            std::wstring setRes = DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
-            AppendTrace(L"[State3] set_desc_len=" + std::to_wstring(setRes.size()));
+        if (id > 0 && state == 3) {
+            StartWorker(o, std::to_wstring(id), true);
         }
         return;
     }
