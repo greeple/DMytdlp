@@ -143,18 +143,19 @@ struct PlugInObj {
     std::wstring pluginDir;
 };
 
-static HRESULT __stdcall PI_QI(void* self, REFIID riid, void** ppv) {
+static HRESULT __stdcall PI_QI(void* self, REFIID /*riid*/, void** ppv) {
     if (!ppv) return E_POINTER;
-    if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_IDMPlugIn)) {
-        *ppv = self;
-        InterlockedIncrement(&((PlugInObj*)self)->ref);
-        return S_OK;
-    }
-    *ppv = nullptr;
-    return E_NOINTERFACE;
+    *ppv = self;
+    InterlockedIncrement(&((PlugInObj*)self)->ref);
+    WriteMarker(L"ytdlp_QI.txt");
+    return S_OK;
 }
-static ULONG __stdcall PI_AddRef(void* self)  { return (ULONG)InterlockedIncrement(&((PlugInObj*)self)->ref); }
+static ULONG __stdcall PI_AddRef(void* self) {
+    WriteMarker(L"ytdlp_AddRef.txt");
+    return (ULONG)InterlockedIncrement(&((PlugInObj*)self)->ref);
+}
 static ULONG __stdcall PI_Release(void* self) {
+    WriteMarker(L"ytdlp_Release.txt");
     LONG r = InterlockedDecrement(&((PlugInObj*)self)->ref);
     if (r == 0) delete (PlugInObj*)self;
     return (ULONG)r;
