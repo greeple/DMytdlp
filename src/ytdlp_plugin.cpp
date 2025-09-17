@@ -5,6 +5,7 @@
 #include <memory>
 
 #pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "user32.lib")
 // Экспорт: красивое имя и декорированное stdcall @4 (out-параметр)
 #pragma comment(linker, "/export:RegisterPlugIn=_RegisterPlugIn@4")
 
