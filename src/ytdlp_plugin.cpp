@@ -1,7 +1,8 @@
 #include <windows.h>
-#include <oleaut32.h>
+#include <oleauto.h>
 #include <string>
 #include <vector>
+#include <memory>
 
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "user32.lib")
@@ -368,7 +369,7 @@ static void StartWorker(PlugInObj* o, const std::wstring& id, bool fromState) {
     }
 }
 
-// События (без таймеров)
+// События (таймеры игнорируем в trace)
 static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR eventData) {
     if (ret) *ret = SysAllocString(L"");
     auto* o = (PlugInObj*)self;
@@ -377,8 +378,7 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
     std::wstring et = BSTRtoW(eventType);
     std::wstring ed = BSTRtoW(eventData);
 
-    // Не пишем таймеры в trace
-    if (et.rfind(L"dm_timer_", 0) != 0) {
+    if (et.rfind(L"dm_timer_", 0) != 0) { // не пишем таймеры в trace
         AppendTrace(L"[Event] " + et + L" | " + ed);
     }
 
