@@ -5,7 +5,7 @@
 #include <memory>
 
 #pragma comment(lib, "oleaut32.lib")
-// ВАЖНО: экспортируем имя RegisterPlugIn и его декорированный вариант _RegisterPlugIn@4
+// Экспорт: красивое имя и декорированное stdcall @4 (out-параметр)
 #pragma comment(linker, "/export:RegisterPlugIn=_RegisterPlugIn@4")
 
 static HMODULE g_hModule = nullptr;
@@ -22,42 +22,9 @@ static void WriteMarker(const wchar_t* name) {
     if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
 }
 static inline void SetRet(BSTR* ret, const wchar_t* s) { if (ret) *ret = SysAllocString(s); }
+static std::wstring BSTRtoW(BSTR s) { return s ? std::wstring(s, SysStringLen(s)) : L""; }
 
-// Виртуальная таблица и объект (Delphi-ABI: ret-first)
-struct PlugInObj;
-struct PlugInVtbl {
-    // IUnknown
-    HRESULT (__stdcall* QueryInterface)(void*, REFIID, void**);
-    ULONG   (__stdcall* AddRef)(void*);
-    ULONG   (__stdcall* Release)(void*);
-
-    // IDMPlugIn (Delphi: WideString-возвраты идут как "out BSTR first, self second")
-    void (__stdcall* getID)(BSTR* ret, void* self);
-    void (__stdcall* GetName)(BSTR* ret, void* self);
-    void (__stdcall* GetVersion)(BSTR* ret, void* self);
-    void (__stdcall* GetDescription)(BSTR* ret, void* self, BSTR language);
-    void (__stdcall* GetEmail)(BSTR* ret, void* self);
-    void (__stdcall* GetHomepage)(BSTR* ret, void* self);
-    void (__stdcall* GetCopyright)(BSTR* ret, void* self);
-    void (__stdcall* GetMinAppVersion)(BSTR* ret, void* self);
-
-    void (__stdcall* PluginInit)(void* self, void* dmInterface);
-    void (__stdcall* PluginConfigure)(void* self, BSTR params);
-    void (__stdcall* BeforeUnload)(void* self);
-
-    void (__stdcall* EventRaised)(BSTR* ret, void* self, BSTR eventType, BSTR eventData);
-};
-
-// Обновим PlugInObj
-struct PlugInObj {
-    PlugInVtbl* lpVtbl;
-    volatile LONG ref;
-    void* dm;
-    std::wstring pluginDir;
-    std::wstring ytdlpPath;
-};
-
-// DMInterface (Delphi-ABI: ret-first)
+// DMInterface (Delphi ABI: DoAction(out BSTR, self, action, params))
 struct DMInterfaceVtbl {
     HRESULT (__stdcall* QueryInterface)(void*, REFIID, void**);
     ULONG   (__stdcall* AddRef)(void*);
@@ -66,79 +33,142 @@ struct DMInterfaceVtbl {
 };
 struct DMInterface { DMInterfaceVtbl* lpVtbl; };
 
-static std::wstring BSTRtoW(BSTR s) { return s ? std::wstring(s, SysStringLen(s)) : L""; }
-
 static std::wstring DM_DoAction(void* pDm, const std::wstring& a, const std::wstring& p) {
     if (!pDm) return L"";
     auto* dm = reinterpret_cast<DMInterface*>(pDm);
     if (!dm->lpVtbl || !dm->lpVtbl->DoAction) return L"";
-    BSTR ret=nullptr, ba=SysAllocStringLen(a.data(), (UINT)a.size()), bp=SysAllocStringLen(p.data(), (UINT)p.size());
+    BSTR ret = nullptr;
+    BSTR ba = SysAllocStringLen(a.data(), (UINT)a.size());
+    BSTR bp = SysAllocStringLen(p.data(), (UINT)p.size());
     dm->lpVtbl->DoAction(&ret, pDm, ba, bp);
-    if (ba) SysFreeString(ba); if (bp) SysFreeString(bp);
+    if (ba) SysFreeString(ba);
+    if (bp) SysFreeString(bp);
     std::wstring w = BSTRtoW(ret);
     if (ret) SysFreeString(ret);
     return w;
 }
 
-// Процесс + stdout
+// Запуск процесса с захватом stdout (UTF-8)
 static bool RunProcessCapture(const std::wstring& app, const std::wstring& args, std::string& outUtf8, DWORD& exitCode) {
     SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
-    HANDLE r=NULL,w=NULL; if (!CreatePipe(&r,&w,&sa,0)) return false;
-    SetHandleInformation(r,HANDLE_FLAG_INHERIT,0);
-    std::wstring cmd=L"\""+app+L"\" "+args;
-    std::vector<wchar_t> buf(cmd.begin(), cmd.end()); buf.push_back(L'\0');
-    STARTUPINFOW si{}; si.cb=sizeof(si); si.dwFlags=STARTF_USESTDHANDLES|STARTF_USESHOWWINDOW; si.wShowWindow=SW_HIDE; si.hStdOutput=w; si.hStdError=w;
+    HANDLE r = NULL, w = NULL;
+    if (!CreatePipe(&r, &w, &sa, 0)) return false;
+    SetHandleInformation(r, HANDLE_FLAG_INHERIT, 0);
+
+    std::wstring cmd = L"\"" + app + L"\" " + args;
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+    buf.push_back(L'\0');
+
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = w; si.hStdError = w;
+
     PROCESS_INFORMATION pi{};
-    BOOL ok=CreateProcessW(nullptr, buf.data(), nullptr,nullptr, TRUE, CREATE_NO_WINDOW, nullptr,nullptr,&si,&pi);
-    CloseHandle(w); if(!ok){ CloseHandle(r); return false; }
-    char tmp[4096]; DWORD rd=0; outUtf8.clear();
-    while (ReadFile(r,tmp,sizeof(tmp),&rd,nullptr) && rd>0) outUtf8.append(tmp,tmp+rd);
+    BOOL ok = CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(w);
+    if (!ok) { CloseHandle(r); return false; }
+
+    char tmp[4096]; DWORD rd = 0; outUtf8.clear();
+    while (ReadFile(r, tmp, sizeof(tmp), &rd, nullptr) && rd > 0) outUtf8.append(tmp, tmp + rd);
     CloseHandle(r);
+
     WaitForSingleObject(pi.hProcess, INFINITE);
     GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
     return true;
 }
-static std::wstring Utf8ToW(const std::string& s){
-    if(s.empty()) return L"";
-    int n=MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),nullptr,0);
-    std::wstring w(n,L'\0'); MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),&w[0],n);
+
+static std::wstring Utf8ToW(const std::string& s) {
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
 }
-static std::wstring XmlEscape(const std::wstring& in){
-    std::wstring out; out.reserve(in.size()+16);
-    for(wchar_t c:in){ switch(c){
-        case L'&': out+=L"&amp;"; break; case L'<': out+=L"&lt;"; break;
-        case L'>': out+=L"&gt;"; break; case L'"': out+=L"&quot;"; break;
-        case L'\'':out+=L"&apos;"; break; default: out+=c; break; } }
+
+static std::wstring XmlEscape(const std::wstring& in) {
+    std::wstring out; out.reserve(in.size() + 16);
+    for (wchar_t c : in) {
+        switch (c) {
+            case L'&': out += L"&amp;";  break;
+            case L'<': out += L"&lt;";   break;
+            case L'>': out += L"&gt;";   break;
+            case L'"': out += L"&quot;"; break;
+            case L'\'':out += L"&apos;"; break;
+            default:   out += c;         break;
+        }
+    }
     return out;
 }
-static std::wstring PathJoin(const std::wstring& a, const std::wstring& b){
-    if(a.empty()) return b; if(a.back()==L'\\'||a.back()==L'/') return a+b; return a+L"\\"+b;
+
+static std::wstring PathJoin(const std::wstring& a, const std::wstring& b) {
+    if (a.empty()) return b;
+    if (a.back() == L'\\' || a.back() == L'/') return a + b;
+    return a + L"\\" + b;
 }
-static std::wstring ReadIniYtDlp(const std::wstring& dir){
-    if(dir.empty()) return L"yt-dlp.exe";
-    std::wstring ini=PathJoin(dir,L"ytdlp.ini");
-    DWORD attr=GetFileAttributesW(ini.c_str());
-    if(attr!=INVALID_FILE_ATTRIBUTES && !(attr&FILE_ATTRIBUTE_DIRECTORY)){
-        wchar_t buf[1024]={0}; DWORD n=GetPrivateProfileStringW(L"ytdlp",L"path",L"",buf,1024,ini.c_str());
-        if(n>0) return std::wstring(buf,n);
+
+static std::wstring ReadIniYtDlp(const std::wstring& dir) {
+    if (dir.empty()) return L"yt-dlp.exe";
+    std::wstring ini = PathJoin(dir, L"ytdlp.ini");
+    DWORD attr = GetFileAttributesW(ini.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        wchar_t buf[1024] = {0};
+        DWORD n = GetPrivateProfileStringW(L"ytdlp", L"path", L"", buf, 1024, ini.c_str());
+        if (n > 0) return std::wstring(buf, n);
     }
     return L"yt-dlp.exe";
 }
-static std::wstring ExtractTag(const std::wstring& xml, const wchar_t* t){
-    std::wstring open=L"<";open+=t;open+=L">"; std::wstring close=L"</";close+=t;close+=L">";
-    size_t i=xml.find(open); if(i==std::wstring::npos) return L""; i+=open.size();
-    size_t j=xml.find(close,i); if(j==std::wstring::npos) return L"";
-    return xml.substr(i,j-i);
+
+static std::wstring ExtractTag(const std::wstring& xml, const wchar_t* t) {
+    std::wstring open = L"<"; open += t; open += L">";
+    std::wstring close = L"</"; close += t; close += L">";
+    size_t i = xml.find(open);
+    if (i == std::wstring::npos) return L"";
+    i += open.size();
+    size_t j = xml.find(close, i);
+    if (j == std::wstring::npos) return L"";
+    return xml.substr(i, j - i);
 }
-static void AddLog(PlugInObj* o, const std::wstring& id, int type, const std::wstring& msg){
-    if(!o||!o->dm) return;
-    std::wstring xml=L"<id>"+id+L"</id><type>"+std::to_wstring(type)+L"</type><logstring>"+XmlEscape(msg)+L"</logstring>";
+
+// Виртуальная таблица и объект (Delphi-ABI: ret-first)
+struct PlugInObj;
+struct PlugInVtbl {
+    // IUnknown
+    HRESULT (__stdcall* QueryInterface)(void*, REFIID, void**);
+    ULONG   (__stdcall* AddRef)(void*);
+    ULONG   (__stdcall* Release)(void*);
+    // IDMPlugIn
+    void (__stdcall* getID)(BSTR* ret, void* self);
+    void (__stdcall* GetName)(BSTR* ret, void* self);
+    void (__stdcall* GetVersion)(BSTR* ret, void* self);
+    void (__stdcall* GetDescription)(BSTR* ret, void* self, BSTR language);
+    void (__stdcall* GetEmail)(BSTR* ret, void* self);
+    void (__stdcall* GetHomepage)(BSTR* ret, void* self);
+    void (__stdcall* GetCopyright)(BSTR* ret, void* self);
+    void (__stdcall* GetMinAppVersion)(BSTR* ret, void* self);
+    void (__stdcall* PluginInit)(void* self, void* dmInterface);
+    void (__stdcall* PluginConfigure)(void* self, BSTR params);
+    void (__stdcall* BeforeUnload)(void* self);
+    void (__stdcall* EventRaised)(BSTR* ret, void* self, BSTR eventType, BSTR eventData);
+};
+
+struct PlugInObj {
+    PlugInVtbl* lpVtbl;
+    volatile LONG ref;
+    void* dm;
+    std::wstring pluginDir;
+    std::wstring ytdlpPath;
+};
+
+static void AddLog(PlugInObj* o, const std::wstring& id, int type, const std::wstring& msg) {
+    if (!o || !o->dm) return;
+    std::wstring xml = L"<id>" + id + L"</id><type>" + std::to_wstring(type) + L"</type><logstring>" + XmlEscape(msg) + L"</logstring>";
     DM_DoAction(o->dm, L"AddStringToLog", xml);
 }
 
-// IUnknown (делаем максимально простыми и с маркерами)
+// IUnknown
 static HRESULT __stdcall PI_QI(void* self, REFIID, void** ppv) {
     if (!ppv) return E_POINTER;
     *ppv = self;
@@ -161,18 +191,13 @@ static ULONG __stdcall PI_Release(void* self) {
 static void __stdcall PI_getID(BSTR* ret, void*)            { WriteMarker(L"ytdlp_getID.txt");            SetRet(ret, L"{F1E5C3A0-8C33-4D4C-8DE0-6B5ACF0F31C5}"); }
 static void __stdcall PI_GetName(BSTR* ret, void*)          { WriteMarker(L"ytdlp_GetName.txt");          SetRet(ret, L"ytdlp plugin"); }
 static void __stdcall PI_GetVersion(BSTR* ret, void*)       { WriteMarker(L"ytdlp_GetVersion.txt");       SetRet(ret, L"0.1.0"); }
-static void __stdcall PI_GetDescription(BSTR* ret, void*, BSTR language) {
+
+// Временно только ASCII (чтоб не было «кривых» букв в UI)
+static void __stdcall PI_GetDescription(BSTR* ret, void*, BSTR /*language*/) {
     WriteMarker(L"ytdlp_GetDescription.txt");
-    const wchar_t* ru = L"Плагин-тест";
-    const wchar_t* en = L"Plugin test";
-    if (language) {
-        std::wstring l(language, SysStringLen(language));
-        if (!_wcsicmp(l.c_str(), L"russian") || !_wcsicmp(l.c_str(), L"ukrainian") || !_wcsicmp(l.c_str(), L"belarusian")) {
-            SetRet(ret, ru); return;
-        }
-    }
-    SetRet(ret, en);
+    SetRet(ret, L"YTDLP test plugin (fills title via yt-dlp).");
 }
+
 static void __stdcall PI_GetEmail(BSTR* ret, void*)         { WriteMarker(L"ytdlp_GetEmail.txt");         SetRet(ret, L"dev@example.com"); }
 static void __stdcall PI_GetHomepage(BSTR* ret, void*)      { WriteMarker(L"ytdlp_GetHomepage.txt");      SetRet(ret, L"https://example.com"); }
 static void __stdcall PI_GetCopyright(BSTR* ret, void*)     { WriteMarker(L"ytdlp_GetCopyright.txt");     SetRet(ret, L"\x00A9 2025 Example"); }
@@ -180,13 +205,25 @@ static void __stdcall PI_GetMinAppVersion(BSTR* ret, void*) { WriteMarker(L"ytdl
 
 static void __stdcall PI_PluginInit(void* self, void* dmInterface) {
     WriteMarker(L"ytdlp_PluginInit.txt");
-    auto* o=(PlugInObj*)self; o->dm=dmInterface;
+    auto* o = (PlugInObj*)self;
+    o->dm = dmInterface;
+
+    // Пути
     o->pluginDir = DM_DoAction(o->dm, L"GetPluginDir", L"");
-    for(auto& ch:o->pluginDir) if(ch==L'/') ch=L'\\';
+    for (auto& ch : o->pluginDir) if (ch == L'/') ch = L'\\';
     o->ytdlpPath = ReadIniYtDlp(o->pluginDir);
+
+    // Диагностика DoAction: GetProgramName
+    std::wstring pn = DM_DoAction(o->dm, L"GetProgramName", L"");
+    WriteMarker(pn.empty() ? L"ytdlp_doaction_progname_FAIL.txt"
+                           : L"ytdlp_doaction_progname_OK.txt");
 }
-static void __stdcall PI_PluginConfigure(void*, BSTR)       { WriteMarker(L"ytdlp_PluginConfigure.txt"); }
-static void __stdcall PI_BeforeUnload(void*)                { WriteMarker(L"ytdlp_BeforeUnload.txt"); }
+
+static void __stdcall PI_PluginConfigure(void*, BSTR /*params*/) {
+    WriteMarker(L"ytdlp_PluginConfigure.txt");
+    MessageBoxW(nullptr, L"YTDLP plugin settings (stub)", L"ytdlp", MB_OK | MB_ICONINFORMATION);
+}
+static void __stdcall PI_BeforeUnload(void*) { WriteMarker(L"ytdlp_BeforeUnload.txt"); }
 
 static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR eventData) {
     if (ret) *ret = SysAllocString(L"");
@@ -194,7 +231,7 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
     std::wstring et = BSTRtoW(eventType);
     std::wstring ed = BSTRtoW(eventData);
 
-    // Маркер события (есть уже)
+    // Маркер события
     if (!et.empty()) {
         std::wstring fn = L"ytdlp_ev_" + et + L".txt";
         WriteMarker(fn.c_str());
@@ -203,26 +240,32 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
     if (!o || !o->dm) return;
 
     if (et == L"dm_download_added") {
-        const std::wstring id = ed; // eventData = ID
+        const std::wstring id = ed;
+
+        // Диагностика DoAction: GetDownloadInfoByID
+        std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", id);
+        WriteMarker(info.empty() ? L"ytdlp_doaction_info_FAIL.txt"
+                                 : L"ytdlp_doaction_info_OK.txt");
+        if (info.empty()) return;
+
         AddLog(o, id, 2, L"[ytdlp] dm_download_added");
 
-        // Получим XML и URL
-        std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", id);
-        std::wstring url  = ExtractTag(info, L"url");
+        // URL
+        std::wstring url = ExtractTag(info, L"url");
         if (url.empty()) { AddLog(o, id, 3, L"[ytdlp] empty url"); return; }
 
-        // Быстрый режим: yt-dlp -e (title)
+        // yt-dlp -e (title)
         std::wstring args = L"-e --no-warnings -- \"" + url + L"\"";
-        std::string out; DWORD ec=0;
-        bool ok = RunProcessCapture(o->ytdlpPath.empty()?L"yt-dlp.exe":o->ytdlpPath, args, out, ec);
-        if (!ok || ec!=0 || out.empty()) { AddLog(o, id, 3, L"[ytdlp] probe failed"); return; }
+        std::string out; DWORD ec = 0;
+        bool ok = RunProcessCapture(o->ytdlpPath.empty() ? L"yt-dlp.exe" : o->ytdlpPath, args, out, ec);
+        if (!ok || ec != 0 || out.empty()) { AddLog(o, id, 3, L"[ytdlp] probe failed"); return; }
 
-        while (!out.empty() && (out.back()=='\r' || out.back()=='\n')) out.pop_back();
+        while (!out.empty() && (out.back() == '\r' || out.back() == '\n')) out.pop_back();
         std::wstring title = Utf8ToW(out);
         if (title.empty()) { AddLog(o, id, 3, L"[ytdlp] empty title"); return; }
 
-        // Обновим описание
-        std::wstring patch = L"<id>"+id+L"</id><description>"+XmlEscape(title)+L" [yt-dlp]</description>";
+        // Обновить описание
+        std::wstring patch = L"<id>" + id + L"</id><description>" + XmlEscape(title) + L" [yt-dlp]</description>";
         DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
         AddLog(o, id, 2, L"[ytdlp] title set");
     }
@@ -236,7 +279,7 @@ static PlugInVtbl g_vtbl = {
     PI_BeforeUnload, PI_EventRaised
 };
 
-// ВАЖНО: DM, судя по твоей версии, ждёт вариант с out-параметром
+// Вариант RegisterPlugIn с out-параметром (ожидается твоим DM)
 extern "C" __declspec(dllexport) HRESULT __stdcall RegisterPlugIn(void** out) {
     WriteMarker(L"ytdlp_RegisterPlugIn_called.txt");
     if (!out) return E_POINTER;
