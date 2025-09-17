@@ -289,20 +289,14 @@ static void __stdcall PI_PluginConfigure(void*, BSTR /*params*/) {
 }
 static void __stdcall PI_BeforeUnload(void*) { WriteMarker(L"ytdlp_BeforeUnload.txt"); }
 
-static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR eventData) {
+static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR eventData) {static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR eventData) {
     if (ret) *ret = SysAllocString(L"");
     auto* o = (PlugInObj*)self;
     std::wstring et = BSTRtoW(eventType);
     std::wstring ed = BSTRtoW(eventData);
 
-    // Текстовый лог событий
+    // Текстовый трейс всех событий
     AppendTrace(L"[Event] " + et + L" | " + ed);
-
-    // Маркер события
-    if (!et.empty()) {
-        std::wstring fn = L"ytdlp_ev_" + et + L".txt";
-        WriteMarker(fn.c_str());
-    }
 
     if (!o || !o->dm) return;
 
@@ -313,7 +307,9 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
         return std::to_wstring(id);
     };
 
-    if (et == L"dm_download_added") {
+    // dm_download_added — матчим по подстроке, на всякий
+    if (et.find(L"dm_download_added") != std::wstring::npos) {
+        AppendTrace(L"[Match] added");
         const std::wstring id = getIdStr(ed);
         if (id.empty()) { AppendTrace(L"[ParseID] FAIL on added"); return; }
 
@@ -322,6 +318,7 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
         AppendTrace(L"[InfoOnAdded] " + std::to_wstring(info.size()) + L" bytes");
         if (info.empty()) return;
 
+        // Запишем в DM лог (если он отображает плагиновые записи)
         AddLog(o, id, 2, L"[ytdlp] dm_download_added");
 
         // URL
@@ -342,10 +339,12 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
         std::wstring patch = L"<id>" + id + L"</id><description>" + XmlEscape(title) + L" [yt-dlp]</description>";
         DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
         AddLog(o, id, 2, L"[ytdlp] title set");
+        return;
     }
 
-    if (et == L"dm_download_state") {
-        // Формат: "ID STATE"
+    // dm_download_state — формируем ID/STATE, сработает как fallback
+    if (et.find(L"dm_download_state") != std::wstring::npos) {
+        AppendTrace(L"[Match] state");
         int id = 0, state = 0;
         {
             const wchar_t* p = ed.c_str();
@@ -381,6 +380,7 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
             DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
             AddLog(o, sid, 2, L"[ytdlp] title set (state)");
         }
+        return;
     }
 }
 
