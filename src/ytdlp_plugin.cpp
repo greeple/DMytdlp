@@ -6,7 +6,7 @@
 
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "user32.lib")
-// Экспорт: красивое имя и декорированное stdcall @4 (out-параметр)
+// Экспорт: красивое имя + stdcall декорированное @4 (out-параметр)
 #pragma comment(linker, "/export:RegisterPlugIn=_RegisterPlugIn@4")
 
 static HMODULE g_hModule = nullptr;
@@ -24,6 +24,15 @@ static void WriteMarker(const wchar_t* name) {
 }
 static inline void SetRet(BSTR* ret, const wchar_t* s) { if (ret) *ret = SysAllocString(s); }
 static std::wstring BSTRtoW(BSTR s) { return s ? std::wstring(s, SysStringLen(s)) : L""; }
+
+static bool ParseLeadingInt(const std::wstring& s, int& out) {
+    const wchar_t* p = s.c_str();
+    wchar_t* end = nullptr;
+    long v = wcstol(p, &end, 10);
+    if (p == end) return false; // нет цифр в начале
+    out = (int)v;
+    return true;
+}
 
 // DMInterface (Delphi ABI: DoAction(out BSTR, self, action, params))
 struct DMInterfaceVtbl {
@@ -192,13 +201,11 @@ static ULONG __stdcall PI_Release(void* self) {
 static void __stdcall PI_getID(BSTR* ret, void*)            { WriteMarker(L"ytdlp_getID.txt");            SetRet(ret, L"{F1E5C3A0-8C33-4D4C-8DE0-6B5ACF0F31C5}"); }
 static void __stdcall PI_GetName(BSTR* ret, void*)          { WriteMarker(L"ytdlp_GetName.txt");          SetRet(ret, L"ytdlp plugin"); }
 static void __stdcall PI_GetVersion(BSTR* ret, void*)       { WriteMarker(L"ytdlp_GetVersion.txt");       SetRet(ret, L"0.1.0"); }
-
-// Временно только ASCII (чтоб не было «кривых» букв в UI)
+// Временно только ASCII описание
 static void __stdcall PI_GetDescription(BSTR* ret, void*, BSTR /*language*/) {
     WriteMarker(L"ytdlp_GetDescription.txt");
     SetRet(ret, L"YTDLP test plugin (fills title via yt-dlp).");
 }
-
 static void __stdcall PI_GetEmail(BSTR* ret, void*)         { WriteMarker(L"ytdlp_GetEmail.txt");         SetRet(ret, L"dev@example.com"); }
 static void __stdcall PI_GetHomepage(BSTR* ret, void*)      { WriteMarker(L"ytdlp_GetHomepage.txt");      SetRet(ret, L"https://example.com"); }
 static void __stdcall PI_GetCopyright(BSTR* ret, void*)     { WriteMarker(L"ytdlp_GetCopyright.txt");     SetRet(ret, L"\x00A9 2025 Example"); }
@@ -240,8 +247,16 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
 
     if (!o || !o->dm) return;
 
+    // Универсально выдёргиваем ID из начала строки
+    auto getIdStr = [&](const std::wstring& s)->std::wstring {
+        int id = 0;
+        if (!ParseLeadingInt(s, id)) return L"";
+        return std::to_wstring(id);
+    };
+
     if (et == L"dm_download_added") {
-        const std::wstring id = ed;
+        const std::wstring id = getIdStr(ed);
+        if (id.empty()) { WriteMarker(L"ytdlp_added_id_PARSE_FAIL.txt"); return; }
 
         // Диагностика DoAction: GetDownloadInfoByID
         std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", id);
@@ -269,6 +284,49 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
         std::wstring patch = L"<id>" + id + L"</id><description>" + XmlEscape(title) + L" [yt-dlp]</description>";
         DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
         AddLog(o, id, 2, L"[ytdlp] title set");
+    }
+
+    // Дополнительно обработаем «переход в загрузку» — часто здесь инфо уже доступно
+    if (et == L"dm_download_state") {
+        // Формат: "ID STATE"
+        int id = 0, state = 0;
+        {
+            const wchar_t* p = ed.c_str();
+            wchar_t* end = nullptr;
+            long v1 = wcstol(p, &end, 10);
+            if (p == end) return;
+            id = (int)v1;
+            if (*end) {
+                const wchar_t* p2 = end;
+                long v2 = wcstol(p2, nullptr, 10);
+                state = (int)v2;
+            }
+        }
+        // 3 == dsDownloading
+        if (state == 3 && id > 0) {
+            std::wstring sid = std::to_wstring(id);
+            std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", sid);
+            WriteMarker(info.empty() ? L"ytdlp_doaction_info_on_state_FAIL.txt"
+                                     : L"ytdlp_doaction_info_on_state_OK.txt");
+            if (info.empty()) return;
+
+            // Если описание пустое — попробуем проставить title
+            std::wstring url = ExtractTag(info, L"url");
+            if (url.empty()) return;
+
+            std::wstring args = L"-e --no-warnings -- \"" + url + L"\"";
+            std::string out; DWORD ec = 0;
+            bool ok = RunProcessCapture(o->ytdlpPath.empty() ? L"yt-dlp.exe" : o->ytdlpPath, args, out, ec);
+            if (!ok || ec != 0 || out.empty()) return;
+
+            while (!out.empty() && (out.back() == '\r' || out.back() == '\n')) out.pop_back();
+            std::wstring title = Utf8ToW(out);
+            if (title.empty()) return;
+
+            std::wstring patch = L"<id>" + sid + L"</id><description>" + XmlEscape(title) + L" [yt-dlp]</description>";
+            DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
+            AddLog(o, sid, 2, L"[ytdlp] title set (state)");
+        }
     }
 }
 
