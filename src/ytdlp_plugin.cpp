@@ -305,12 +305,10 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
     PlugInObj* o = ctx->o;
     if (!o || !o->dm) return 0;
 
-    // держим плагин живым на время
     InterlockedIncrement(&o->ref);
-
     AppendTrace(L"[Worker] start id=" + ctx->id + (ctx->fromState ? L" [state]" : L" [added]"));
 
-    // 1) получить info
+    // 1) info
     std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", ctx->id);
     AppendTrace(L"[Worker] info_len=" + std::to_wstring(info.size()));
     if (info.empty()) {
@@ -319,7 +317,7 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
         return 0;
     }
 
-    // 2) достать URL
+    // 2) url
     std::wstring url = ExtractTag(info, L"url");
     if (url.empty()) {
         AppendTrace(L"[Worker] no url");
@@ -327,9 +325,9 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
         return 0;
     }
 
-    // 3) yt-dlp -e (title)
+    // 3) yt-dlp -J (JSON, UTF‑8)
     std::wstring app = o->ytdlpPath.empty() ? L"yt-dlp.exe" : o->ytdlpPath;
-    std::wstring args = L"-e --no-warnings -- \"" + url + L"\"";
+    std::wstring args = L"-J --no-warnings --dump-single-json -- \"" + url + L"\"";
     std::string out; DWORD ec = 0;
     bool ok = RunProcessCapture(app, args, out, ec);
     if (!ok || ec != 0 || out.empty()) {
@@ -337,15 +335,27 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
         InterlockedDecrement(&o->ref);
         return 0;
     }
-    while (!out.empty() && (out.back()=='\r' || out.back()=='\n')) out.pop_back();
-    std::wstring title = Utf8ToW(out);
+
+    std::wstring json = Utf8ToW(out);
+    std::wstring title;
+    size_t k = json.find(L"\"title\"");
+    if (k != std::wstring::npos) {
+        k = json.find(L":", k);
+        if (k != std::wstring::npos) {
+            size_t q1 = json.find(L"\"", k + 1);
+            size_t q2 = (q1 != std::wstring::npos) ? json.find(L"\"", q1 + 1) : std::wstring::npos;
+            if (q1 != std::wstring::npos && q2 != std::wstring::npos && q2 > q1) {
+                title = json.substr(q1 + 1, q2 - q1 - 1);
+            }
+        }
+    }
     AppendTrace(L"[Worker] title=\"" + title + L"\"");
     if (title.empty()) {
         InterlockedDecrement(&o->ref);
         return 0;
     }
 
-    // 4) поставить описание
+    // 4) описание
     std::wstring patch = L"<id>" + ctx->id + L"</id><description>" + XmlEscape(title) + L" [yt-dlp]</description>";
     std::wstring setRes = DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
     AppendTrace(L"[Worker] set_desc_len=" + std::to_wstring(setRes.size()));
@@ -354,6 +364,9 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
     std::wstring logmsg = ctx->fromState ? L"[ytdlp] title set (state)" : L"[ytdlp] title set";
     std::wstring logxml = L"<id>" + ctx->id + L"</id><type>2</type><logstring>" + XmlEscape(logmsg) + L"</logstring>";
     DM_DoAction(o->dm, L"AddStringToLog", logxml);
+
+    // Если нужно — можно рестартовать закачку:
+    // DM_DoAction(o->dm, L"StartDownloads", ctx->id);
 
     InterlockedDecrement(&o->ref);
     return 0;
@@ -369,7 +382,26 @@ static void StartWorker(PlugInObj* o, const std::wstring& id, bool fromState) {
     }
 }
 
-// События (таймеры игнорируем в trace)
+// ---------- События (таймеры не логируем) ----------
+static CRITICAL_SECTION g_cs;
+static bool g_csInit = false;
+static std::vector<int> g_inflight;
+
+static bool BeginJob(int id) {
+    EnterCriticalSection(&g_cs);
+    for (int v : g_inflight) { if (v == id) { LeaveCriticalSection(&g_cs); return false; } }
+    g_inflight.push_back(id);
+    LeaveCriticalSection(&g_cs);
+    return true;
+}
+static void EndJob(int id) {
+    EnterCriticalSection(&g_cs);
+    for (size_t i = 0; i < g_inflight.size(); ++i) {
+        if (g_inflight[i] == id) { g_inflight.erase(g_inflight.begin() + i); break; }
+    }
+    LeaveCriticalSection(&g_cs);
+}
+
 static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR eventData) {
     if (ret) *ret = SysAllocString(L"");
     auto* o = (PlugInObj*)self;
@@ -378,7 +410,7 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
     std::wstring et = BSTRtoW(eventType);
     std::wstring ed = BSTRtoW(eventData);
 
-    if (et.rfind(L"dm_timer_", 0) != 0) { // не пишем таймеры в trace
+    if (et.rfind(L"dm_timer_", 0) != 0) { // не пишем таймеры
         AppendTrace(L"[Event] " + et + L" | " + ed);
     }
 
@@ -388,20 +420,19 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
         return std::to_wstring(id);
     };
 
+    // added — только для инфо
     if (et.find(L"dm_download_added") != std::wstring::npos) {
-        std::wstring id = getIdStr(ed);
-        if (id.empty()) { AppendTrace(L"[Added] ParseID FAIL"); return; }
-        AppendTrace(L"[Added] id=" + id);
-        StartWorker(o, id, false);
+        AppendTrace(L"[Added] raw=" + ed);
         return;
     }
 
+    // state: ID STATE
     if (et.find(L"dm_download_state") != std::wstring::npos) {
         int id = 0, state = 0;
         {
             const wchar_t* p = ed.c_str(); wchar_t* end = nullptr;
             long v1 = wcstol(p, &end, 10);
-            if (p == end) { AppendTrace(L"[State] ParseID FAIL"); return; }
+            if (p == end) return;
             id = (int)v1;
             if (*end) {
                 const wchar_t* p2 = end;
@@ -410,8 +441,19 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
             }
         }
         AppendTrace(L"[State] id=" + std::to_wstring(id) + L" state=" + std::to_wstring(state));
-        if (id > 0 && state == 3) {
+        if (id <= 0) return;
+
+        if (state == 3) {
+            // остановим DM, чтобы он не скачивал HTML
+            DM_DoAction(o->dm, L"StopDownloads", std::to_wstring(id));
+            AppendTrace(L"[State3] StopDownloads sent");
+
+            // отбрасываем дубликаты
+            if (!BeginJob(id)) { AppendTrace(L"[State3] skip duplicate id=" + std::to_wstring(id)); return; }
+
             StartWorker(o, std::to_wstring(id), true);
+            // worker сам всё сделает (title, описание, лог)
+            EndJob(id);
         }
         return;
     }
@@ -441,7 +483,10 @@ extern "C" __declspec(dllexport) HRESULT __stdcall RegisterPlugIn(void** out) {
 BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_hModule = h;
+        if (!g_csInit) { InitializeCriticalSection(&g_cs); g_csInit = true; }
         WriteMarker(L"ytdlp_DllMain_attach.txt");
+    } else if (reason == DLL_PROCESS_DETACH) {
+        if (g_csInit) { DeleteCriticalSection(&g_cs); g_csInit = false; }
     }
     return TRUE;
 }
