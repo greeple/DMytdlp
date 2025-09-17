@@ -25,11 +25,56 @@ static void WriteMarker(const wchar_t* name) {
 static inline void SetRet(BSTR* ret, const wchar_t* s) { if (ret) *ret = SysAllocString(s); }
 static std::wstring BSTRtoW(BSTR s) { return s ? std::wstring(s, SysStringLen(s)) : L""; }
 
+static std::string WToUtf8(const std::wstring& ws) {
+    if (ws.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
+    std::string out(n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &out[0], n, nullptr, nullptr);
+    return out;
+}
+static std::wstring NowTs() {
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t buf[64];
+    swprintf(buf, 64, L"%04u-%02u-%02u %02u:%02u:%02u", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return buf;
+}
+static void AppendTrace(const std::wstring& line) {
+    // Путь к ytdlp_trace.txt
+    wchar_t dir[MAX_PATH];
+    DWORD n = GetModuleFileNameW(g_hModule, dir, MAX_PATH);
+    if (!n || n >= MAX_PATH) return;
+    for (int i = (int)n - 1; i >= 0; --i) {
+        if (dir[i] == L'\\' || dir[i] == L'/') { dir[i+1] = 0; break; }
+    }
+    std::wstring path = std::wstring(dir) + L"ytdlp_trace.txt";
+
+    // Проверим размер файла (для BOM)
+    LARGE_INTEGER sz{}; bool isNewFile = false;
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad))
+        isNewFile = true;
+    else
+        isNewFile = (fad.nFileSizeHigh == 0 && fad.nFileSizeLow == 0);
+
+    HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    if (isNewFile) {
+        static const unsigned char bom[] = {0xEF, 0xBB, 0xBF};
+        DWORD wr; WriteFile(h, bom, 3, &wr, nullptr);
+    }
+
+    std::wstring full = NowTs() + L" " + line + L"\r\n";
+    std::string utf8 = WToUtf8(full);
+    DWORD wr; WriteFile(h, utf8.data(), (DWORD)utf8.size(), &wr, nullptr);
+    CloseHandle(h);
+}
+
 static bool ParseLeadingInt(const std::wstring& s, int& out) {
     const wchar_t* p = s.c_str();
     wchar_t* end = nullptr;
     long v = wcstol(p, &end, 10);
-    if (p == end) return false; // нет цифр в начале
+    if (p == end) return false;
     out = (int)v;
     return true;
 }
@@ -47,14 +92,21 @@ static std::wstring DM_DoAction(void* pDm, const std::wstring& a, const std::wst
     if (!pDm) return L"";
     auto* dm = reinterpret_cast<DMInterface*>(pDm);
     if (!dm->lpVtbl || !dm->lpVtbl->DoAction) return L"";
+    // Лог: что отправляем
+    std::wstring pLog = p.substr(0, 512);
+    AppendTrace(L"[DoAction] action=\"" + a + L"\" params=\"" + pLog + L"\"");
+
     BSTR ret = nullptr;
     BSTR ba = SysAllocStringLen(a.data(), (UINT)a.size());
     BSTR bp = SysAllocStringLen(p.data(), (UINT)p.size());
     dm->lpVtbl->DoAction(&ret, pDm, ba, bp);
     if (ba) SysFreeString(ba);
     if (bp) SysFreeString(bp);
+
     std::wstring w = BSTRtoW(ret);
     if (ret) SysFreeString(ret);
+
+    AppendTrace(L"[DoActionResult] action=\"" + a + L"\" result_len=" + std::to_wstring(w.size()));
     return w;
 }
 
@@ -76,6 +128,7 @@ static bool RunProcessCapture(const std::wstring& app, const std::wstring& args,
 
     PROCESS_INFORMATION pi{};
     BOOL ok = CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    AppendTrace(L"[RunApp] " + cmd + (ok ? L" (OK)" : L" (FAIL)"));
     CloseHandle(w);
     if (!ok) { CloseHandle(r); return false; }
 
@@ -87,6 +140,7 @@ static bool RunProcessCapture(const std::wstring& app, const std::wstring& args,
     GetExitCodeProcess(pi.hProcess, &exitCode);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    AppendTrace(L"[RunAppExit] code=" + std::to_wstring(exitCode));
     return true;
 }
 
@@ -201,11 +255,13 @@ static ULONG __stdcall PI_Release(void* self) {
 static void __stdcall PI_getID(BSTR* ret, void*)            { WriteMarker(L"ytdlp_getID.txt");            SetRet(ret, L"{F1E5C3A0-8C33-4D4C-8DE0-6B5ACF0F31C5}"); }
 static void __stdcall PI_GetName(BSTR* ret, void*)          { WriteMarker(L"ytdlp_GetName.txt");          SetRet(ret, L"ytdlp plugin"); }
 static void __stdcall PI_GetVersion(BSTR* ret, void*)       { WriteMarker(L"ytdlp_GetVersion.txt");       SetRet(ret, L"0.1.0"); }
-// Временно только ASCII описание
+
+// Временно только ASCII (чтоб не было «кривых» букв в UI)
 static void __stdcall PI_GetDescription(BSTR* ret, void*, BSTR /*language*/) {
     WriteMarker(L"ytdlp_GetDescription.txt");
     SetRet(ret, L"YTDLP test plugin (fills title via yt-dlp).");
 }
+
 static void __stdcall PI_GetEmail(BSTR* ret, void*)         { WriteMarker(L"ytdlp_GetEmail.txt");         SetRet(ret, L"dev@example.com"); }
 static void __stdcall PI_GetHomepage(BSTR* ret, void*)      { WriteMarker(L"ytdlp_GetHomepage.txt");      SetRet(ret, L"https://example.com"); }
 static void __stdcall PI_GetCopyright(BSTR* ret, void*)     { WriteMarker(L"ytdlp_GetCopyright.txt");     SetRet(ret, L"\x00A9 2025 Example"); }
@@ -239,6 +295,9 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
     std::wstring et = BSTRtoW(eventType);
     std::wstring ed = BSTRtoW(eventData);
 
+    // Текстовый лог событий
+    AppendTrace(L"[Event] " + et + L" | " + ed);
+
     // Маркер события
     if (!et.empty()) {
         std::wstring fn = L"ytdlp_ev_" + et + L".txt";
@@ -256,12 +315,11 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
 
     if (et == L"dm_download_added") {
         const std::wstring id = getIdStr(ed);
-        if (id.empty()) { WriteMarker(L"ytdlp_added_id_PARSE_FAIL.txt"); return; }
+        if (id.empty()) { AppendTrace(L"[ParseID] FAIL on added"); return; }
 
-        // Диагностика DoAction: GetDownloadInfoByID
+        // Инфо о закачке
         std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", id);
-        WriteMarker(info.empty() ? L"ytdlp_doaction_info_FAIL.txt"
-                                 : L"ytdlp_doaction_info_OK.txt");
+        AppendTrace(L"[InfoOnAdded] " + std::to_wstring(info.size()) + L" bytes");
         if (info.empty()) return;
 
         AddLog(o, id, 2, L"[ytdlp] dm_download_added");
@@ -286,7 +344,6 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
         AddLog(o, id, 2, L"[ytdlp] title set");
     }
 
-    // Дополнительно обработаем «переход в загрузку» — часто здесь инфо уже доступно
     if (et == L"dm_download_state") {
         // Формат: "ID STATE"
         int id = 0, state = 0;
@@ -302,15 +359,12 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
                 state = (int)v2;
             }
         }
-        // 3 == dsDownloading
         if (state == 3 && id > 0) {
             std::wstring sid = std::to_wstring(id);
             std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", sid);
-            WriteMarker(info.empty() ? L"ytdlp_doaction_info_on_state_FAIL.txt"
-                                     : L"ytdlp_doaction_info_on_state_OK.txt");
+            AppendTrace(L"[InfoOnState] " + std::to_wstring(info.size()) + L" bytes");
             if (info.empty()) return;
 
-            // Если описание пустое — попробуем проставить title
             std::wstring url = ExtractTag(info, L"url");
             if (url.empty()) return;
 
