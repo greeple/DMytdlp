@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <algorithm>
 
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "user32.lib")
@@ -108,6 +109,72 @@ static std::wstring ExtractTag(const std::wstring& xml, const wchar_t* t) {
     return xml.substr(i, j - i);
 }
 
+// tolower
+static std::wstring ToLower(std::wstring s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](wchar_t c){ return (wchar_t)towlower(c); });
+    return s;
+}
+
+// json unescape (\uXXXX, базовые \n\t\r"\KATEX_INLINE_CLOSE
+static int HexVal(wchar_t c) {
+    if (c >= L'0' && c <= L'9') return c - L'0';
+    if (c >= L'a' && c <= L'f') return 10 + (c - L'a');
+    if (c >= L'A' && c <= L'F') return 10 + (c - L'A');
+    return -1;
+}
+static std::wstring JsonUnescape(const std::wstring& s) {
+    std::wstring out; out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        wchar_t c = s[i];
+        if (c != L'\\') { out += c; continue; }
+        if (i + 1 >= s.size()) { out += c; break; }
+        wchar_t n = s[++i];
+        switch (n) {
+            case L'"':  out += L'"';  break;
+            case L'\\': out += L'\\'; break;
+            case L'/':  out += L'/';  break;
+            case L'b':  out += L'\b'; break;
+            case L'f':  out += L'\f'; break;
+            case L'n':  out += L'\n'; break;
+            case L'r':  out += L'\r'; break;
+            case L't':  out += L'\t'; break;
+            case L'u': {
+                if (i + 4 >= s.size()) { out += L'?'; break; }
+                int h1 = HexVal(s[i+1]), h2 = HexVal(s[i+2]), h3 = HexVal(s[i+3]), h4 = HexVal(s[i+4]);
+                if (h1<0||h2<0||h3<0||h4<0) { out += L'?'; break; }
+                wchar_t w = (wchar_t)((h1<<12)|(h2<<8)|(h3<<4)|h4);
+                i += 4;
+                // суррогаты
+                if (w >= 0xD800 && w <= 0xDBFF) {
+                    if (i + 6 < s.size() && s[i+1] == L'\\' && s[i+2] == L'u') {
+                        int h5=HexVal(s[i+3]), h6=HexVal(s[i+4]), h7=HexVal(s[i+5]), h8=HexVal(s[i+6]);
+                        wchar_t w2 = (wchar_t)((h5<<12)|(h6<<8)|(h7<<4)|h8);
+                        if (w2 >= 0xDC00 && w2 <= 0xDFFF) {
+                            out += w; out += w2; i += 6; break;
+                        }
+                    }
+                }
+                out += w;
+                break;
+            }
+            default: out += n; break;
+        }
+    }
+    return out;
+}
+
+// Быстрая проверка «видеосайт»
+static bool IsVideoSite(const std::wstring& url) {
+    std::wstring u = ToLower(url);
+    return (u.find(L"youtube.com/") != std::wstring::npos) ||
+           (u.find(L"youtu.be/")   != std::wstring::npos) ||
+           (u.find(L"vimeo.com/")  != std::wstring::npos) ||
+           (u.find(L"vk.com/")     != std::wstring::npos && u.find(L"/video") != std::wstring::npos) ||
+           (u.find(L"vkvideo.ru/") != std::wstring::npos) ||
+           (u.find(L"rutube.ru/")  != std::wstring::npos) ||
+           (u.find(L"dailymotion.")!= std::wstring::npos);
+}
+
 // ---------- DMInterface (Delphi-ABI ret-first) ----------
 struct DMInterfaceVtbl {
     HRESULT (__stdcall* QueryInterface)(void*, REFIID, void**);
@@ -121,21 +188,13 @@ static std::wstring DM_DoAction(void* pDm, const std::wstring& a, const std::wst
     if (!pDm) return L"";
     auto* dm = reinterpret_cast<DMInterface*>(pDm);
     if (!dm->lpVtbl || !dm->lpVtbl->DoAction) return L"";
-
-    // логируем, что отправляем
     std::wstring pLog = p.substr(0, 512);
     AppendTrace(L"[DoAction] action=\"" + a + L"\" params=\"" + pLog + L"\"");
-
-    BSTR ret = nullptr;
-    BSTR ba = SysAllocStringLen(a.data(), (UINT)a.size());
-    BSTR bp = SysAllocStringLen(p.data(), (UINT)p.size());
+    BSTR ret=nullptr, ba=SysAllocStringLen(a.data(), (UINT)a.size()), bp=SysAllocStringLen(p.data(), (UINT)p.size());
     dm->lpVtbl->DoAction(&ret, pDm, ba, bp);
-    if (ba) SysFreeString(ba);
-    if (bp) SysFreeString(bp);
-
+    if (ba) SysFreeString(ba); if (bp) SysFreeString(bp);
     std::wstring w = BSTRtoW(ret);
     if (ret) SysFreeString(ret);
-
     AppendTrace(L"[DoActionResult] action=\"" + a + L"\" result_len=" + std::to_wstring(w.size()));
     return w;
 }
@@ -143,53 +202,37 @@ static std::wstring DM_DoAction(void* pDm, const std::wstring& a, const std::wst
 // ---------- запуск внешнего процесса ----------
 static bool RunProcessCapture(const std::wstring& app, const std::wstring& args, std::string& outUtf8, DWORD& exitCode) {
     SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
-    HANDLE r = NULL, w = NULL;
-    if (!CreatePipe(&r, &w, &sa, 0)) return false;
+    HANDLE r=NULL,w=NULL; if (!CreatePipe(&r,&w,&sa,0)) return false;
     SetHandleInformation(r, HANDLE_FLAG_INHERIT, 0);
-
-    std::wstring cmd = L"\"" + app + L"\" " + args;
-    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
-    buf.push_back(L'\0');
-
-    STARTUPINFOW si{}; si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    si.hStdOutput = w; si.hStdError = w;
-
+    std::wstring cmd=L"\""+app+L"\" "+args;
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end()); buf.push_back(L'\0');
+    STARTUPINFOW si{}; si.cb=sizeof(si); si.dwFlags=STARTF_USESTDHANDLES|STARTF_USESHOWWINDOW; si.wShowWindow=SW_HIDE; si.hStdOutput=w; si.hStdError=w;
     PROCESS_INFORMATION pi{};
-    BOOL ok = CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    BOOL ok=CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
     AppendTrace(L"[RunApp] " + cmd + (ok ? L" (OK)" : L" (FAIL)"));
-    CloseHandle(w);
-    if (!ok) { CloseHandle(r); return false; }
-
-    char tmp[4096]; DWORD rd = 0; outUtf8.clear();
-    while (ReadFile(r, tmp, sizeof(tmp), &rd, nullptr) && rd > 0) outUtf8.append(tmp, tmp + rd);
+    CloseHandle(w); if(!ok){ CloseHandle(r); return false; }
+    char tmp[4096]; DWORD rd=0; outUtf8.clear();
+    while (ReadFile(r,tmp,sizeof(tmp),&rd,nullptr) && rd>0) outUtf8.append(tmp,tmp+rd);
     CloseHandle(r);
-
     WaitForSingleObject(pi.hProcess, INFINITE);
     GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     AppendTrace(L"[RunAppExit] code=" + std::to_wstring(exitCode));
     return true;
 }
-
-static std::wstring Utf8ToW(const std::string& s) {
-    if (s.empty()) return L"";
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    std::wstring w(n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+static std::wstring Utf8ToW(const std::string& s){
+    if(s.empty()) return L"";
+    int n=MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),nullptr,0);
+    std::wstring w(n,L'\0'); MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),&w[0],n);
     return w;
 }
-
-static std::wstring ReadIniYtDlp(const std::wstring& dir) {
-    if (dir.empty()) return L"yt-dlp.exe";
-    std::wstring ini = PathJoin(dir, L"ytdlp.ini");
-    DWORD attr = GetFileAttributesW(ini.c_str());
-    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-        wchar_t buf[1024] = {0};
-        DWORD n = GetPrivateProfileStringW(L"ytdlp", L"path", L"", buf, 1024, ini.c_str());
-        if (n > 0) return std::wstring(buf, n);
+static std::wstring ReadIniYtDlp(const std::wstring& dir){
+    if(dir.empty()) return L"yt-dlp.exe";
+    std::wstring ini=PathJoin(dir,L"ytdlp.ini");
+    DWORD attr=GetFileAttributesW(ini.c_str());
+    if(attr!=INVALID_FILE_ATTRIBUTES && !(attr&FILE_ATTRIBUTE_DIRECTORY)){
+        wchar_t buf[1024]={0}; DWORD n=GetPrivateProfileStringW(L"ytdlp",L"path",L"",buf,1024,ini.c_str());
+        if(n>0) return std::wstring(buf,n);
     }
     return L"yt-dlp.exe";
 }
@@ -297,7 +340,6 @@ static void __stdcall PI_BeforeUnload(void* self) {
 struct TaskCtx {
     PlugInObj* o;
     std::wstring id;
-    bool fromState;
 };
 
 static DWORD WINAPI WorkerProc(LPVOID param) {
@@ -306,37 +348,26 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
     if (!o || !o->dm) return 0;
 
     InterlockedIncrement(&o->ref);
-    AppendTrace(L"[Worker] start id=" + ctx->id + (ctx->fromState ? L" [state]" : L" [added]"));
+    AppendTrace(L"[Worker] start id=" + ctx->id);
 
     // 1) info
     std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", ctx->id);
     AppendTrace(L"[Worker] info_len=" + std::to_wstring(info.size()));
-    if (info.empty()) {
-        AppendTrace(L"[Worker] no info");
-        InterlockedDecrement(&o->ref);
-        return 0;
-    }
+    if (info.empty()) { AppendTrace(L"[Worker] no info"); InterlockedDecrement(&o->ref); return 0; }
 
     // 2) url
     std::wstring url = ExtractTag(info, L"url");
-    if (url.empty()) {
-        AppendTrace(L"[Worker] no url");
-        InterlockedDecrement(&o->ref);
-        return 0;
-    }
+    if (url.empty()) { AppendTrace(L"[Worker] no url"); InterlockedDecrement(&o->ref); return 0; }
 
     // 3) yt-dlp -J (JSON, UTF‑8)
     std::wstring app = o->ytdlpPath.empty() ? L"yt-dlp.exe" : o->ytdlpPath;
     std::wstring args = L"-J --no-warnings --dump-single-json -- \"" + url + L"\"";
     std::string out; DWORD ec = 0;
     bool ok = RunProcessCapture(app, args, out, ec);
-    if (!ok || ec != 0 || out.empty()) {
-        AppendTrace(L"[Worker] yt-dlp failed code=" + std::to_wstring(ec));
-        InterlockedDecrement(&o->ref);
-        return 0;
-    }
+    if (!ok || ec != 0 || out.empty()) { AppendTrace(L"[Worker] yt-dlp failed code=" + std::to_wstring(ec)); InterlockedDecrement(&o->ref); return 0; }
 
     std::wstring json = Utf8ToW(out);
+    // взять "title"
     std::wstring title;
     size_t k = json.find(L"\"title\"");
     if (k != std::wstring::npos) {
@@ -345,63 +376,39 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
             size_t q1 = json.find(L"\"", k + 1);
             size_t q2 = (q1 != std::wstring::npos) ? json.find(L"\"", q1 + 1) : std::wstring::npos;
             if (q1 != std::wstring::npos && q2 != std::wstring::npos && q2 > q1) {
-                title = json.substr(q1 + 1, q2 - q1 - 1);
+                title = json.substr(q1 + 1, q2 - q1 - 1); // ещё с \uXXXX
             }
         }
     }
+    title = JsonUnescape(title);
     AppendTrace(L"[Worker] title=\"" + title + L"\"");
-    if (title.empty()) {
-        InterlockedDecrement(&o->ref);
-        return 0;
-    }
+    if (title.empty()) { InterlockedDecrement(&o->ref); return 0; }
 
-    // 4) описание
+    // 4) поставить описание
     std::wstring patch = L"<id>" + ctx->id + L"</id><description>" + XmlEscape(title) + L" [yt-dlp]</description>";
     std::wstring setRes = DM_DoAction(o->dm, L"SetDownloadInfoByID", patch);
     AppendTrace(L"[Worker] set_desc_len=" + std::to_wstring(setRes.size()));
 
     // 5) в лог DM
-    std::wstring logmsg = ctx->fromState ? L"[ytdlp] title set (state)" : L"[ytdlp] title set";
-    std::wstring logxml = L"<id>" + ctx->id + L"</id><type>2</type><logstring>" + XmlEscape(logmsg) + L"</logstring>";
+    std::wstring logxml = L"<id>" + ctx->id + L"</id><type>2</type><logstring>" + XmlEscape(L"[ytdlp] title set") + L"</logstring>";
     DM_DoAction(o->dm, L"AddStringToLog", logxml);
 
-    // Если нужно — можно рестартовать закачку:
-    // DM_DoAction(o->dm, L"StartDownloads", ctx->id);
+    // 6) рестарт, чтобы DM продолжил (и в следующий раз не стопать: по тэгу в description)
+    DM_DoAction(o->dm, L"StartDownloads", ctx->id);
+    AppendTrace(L"[Worker] StartDownloads sent");
 
     InterlockedDecrement(&o->ref);
     return 0;
 }
 
-static void StartWorker(PlugInObj* o, const std::wstring& id, bool fromState) {
-    auto* ctx = new TaskCtx{ o, id, fromState };
+static void StartWorker(PlugInObj* o, const std::wstring& id) {
+    auto* ctx = new TaskCtx{ o, id };
     HANDLE h = CreateThread(nullptr, 0, WorkerProc, ctx, 0, nullptr);
     if (h) CloseHandle(h);
-    else {
-        AppendTrace(L"[Worker] CreateThread FAIL");
-        delete ctx;
-    }
+    else { AppendTrace(L"[Worker] CreateThread FAIL"); delete ctx; }
 }
 
-// ---------- События (таймеры не логируем) ----------
-static CRITICAL_SECTION g_cs;
-static bool g_csInit = false;
-static std::vector<int> g_inflight;
-
-static bool BeginJob(int id) {
-    EnterCriticalSection(&g_cs);
-    for (int v : g_inflight) { if (v == id) { LeaveCriticalSection(&g_cs); return false; } }
-    g_inflight.push_back(id);
-    LeaveCriticalSection(&g_cs);
-    return true;
-}
-static void EndJob(int id) {
-    EnterCriticalSection(&g_cs);
-    for (size_t i = 0; i < g_inflight.size(); ++i) {
-        if (g_inflight[i] == id) { g_inflight.erase(g_inflight.begin() + i); break; }
-    }
-    LeaveCriticalSection(&g_cs);
-}
-
+// ---------- События ----------
 static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR eventData) {
     if (ret) *ret = SysAllocString(L"");
     auto* o = (PlugInObj*)self;
@@ -414,19 +421,7 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
         AppendTrace(L"[Event] " + et + L" | " + ed);
     }
 
-    auto getIdStr = [&](const std::wstring& s)->std::wstring {
-        int id = 0;
-        if (!ParseLeadingInt(s, id)) return L"";
-        return std::to_wstring(id);
-    };
-
-    // added — только для инфо
-    if (et.find(L"dm_download_added") != std::wstring::npos) {
-        AppendTrace(L"[Added] raw=" + ed);
-        return;
-    }
-
-    // state: ID STATE
+    // dm_download_state: "ID STATE"
     if (et.find(L"dm_download_state") != std::wstring::npos) {
         int id = 0, state = 0;
         {
@@ -440,21 +435,38 @@ static void __stdcall PI_EventRaised(BSTR* ret, void* self, BSTR eventType, BSTR
                 state = (int)v2;
             }
         }
-        AppendTrace(L"[State] id=" + std::to_wstring(id) + L" state=" + std::to_wstring(state));
         if (id <= 0) return;
+        AppendTrace(L"[State] id=" + std::to_wstring(id) + L" state=" + std::to_wstring(state));
 
         if (state == 3) {
-            // остановим DM, чтобы он не скачивал HTML
-            DM_DoAction(o->dm, L"StopDownloads", std::to_wstring(id));
-            AppendTrace(L"[State3] StopDownloads sent");
+            std::wstring sid = std::to_wstring(id);
 
-            // отбрасываем дубликаты
-            if (!BeginJob(id)) { AppendTrace(L"[State3] skip duplicate id=" + std::to_wstring(id)); return; }
+            // Возьмём info и проверим: если уже "[yt-dlp]" — ничего не делаем
+            std::wstring info = DM_DoAction(o->dm, L"GetDownloadInfoByID", sid);
+            if (info.find(L"[yt-dlp]") != std::wstring::npos) {
+                AppendTrace(L"[State3] already processed");
+                return;
+            }
+            // Проверим домен: только видео
+            std::wstring url = ExtractTag(info, L"url");
+            if (url.empty() || !IsVideoSite(url)) {
+                AppendTrace(L"[State3] skip non-video url");
+                return;
+            }
 
-            StartWorker(o, std::to_wstring(id), true);
-            // worker сам всё сделает (title, описание, лог)
-            EndJob(id);
+            // Стопнем DM, чтобы не тянул HTML
+            DM_DoAction(o->dm, L"StopDownloads", sid);
+            AppendTrace(L"[State3] StopDownloads sent; start worker");
+
+            // Запуск воркера
+            StartWorker(o, sid);
         }
+        return;
+    }
+
+    // dm_download_added — информативно (без работы): возможен дубликат следом за state
+    if (et.find(L"dm_download_added") != std::wstring::npos) {
+        AppendTrace(L"[Added] raw=" + ed);
         return;
     }
 }
@@ -483,10 +495,7 @@ extern "C" __declspec(dllexport) HRESULT __stdcall RegisterPlugIn(void** out) {
 BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_hModule = h;
-        if (!g_csInit) { InitializeCriticalSection(&g_cs); g_csInit = true; }
         WriteMarker(L"ytdlp_DllMain_attach.txt");
-    } else if (reason == DLL_PROCESS_DETACH) {
-        if (g_csInit) { DeleteCriticalSection(&g_cs); g_csInit = false; }
     }
     return TRUE;
 }
